@@ -997,6 +997,15 @@ async function cmdCancel(argv) {
   const target = (isOk(list) ? toArray(list.data) : []).find((x) => x.uuid === uuidArg || String(x.resvId) === uuidArg);
   const realUuid = target ? target.uuid : uuidArg;
 
+  // 真正取消时，若 uuidArg 既不像 uuid（hex）也不像预约号（纯数字），多半是房间名 → 明确报错，别让后端回一句模糊的「预约信息错误」
+  if (yes && !target) {
+    const looksLikeUuid = /^[0-9a-f]{20,40}$/i.test(uuidArg);
+    const looksLikeResvId = /^\d{4,}$/.test(uuidArg);
+    if (!looksLikeUuid && !looksLikeResvId) {
+      return output({ code: EXIT_FAIL, message: `未找到预约「${uuidArg}」——这看起来是房间名，不是预约号/uuid。请先运行 orders 查预约号，再 cancel --uuid <预约号>` }, json);
+    }
+  }
+
   if (!yes) {
     const desc = target
       ? `：${roomLabelOf(target)}（${fmtTs(target.resvBeginTime)} ~ ${fmtTs(target.resvEndTime)}，状态 ${resvStatusLabel(target.resvStatus)}）`
