@@ -34,7 +34,25 @@ import urllib.request
 import urllib.parse
 from ctypes import wintypes
 
+# 会话加密：从 scripts/lib/crypto.py 导入（AES-256-GCM；cryptography 缺失时自动 pip 安装，装不上则拒绝明文保存）
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+try:
+    from crypto import encrypt as _enc, decrypt as _dec, is_expired as _expired
+except Exception:
+    def _enc(x):
+        raise RuntimeError("会话加密模块加载失败，拒绝以明文保存登录态。")
+    _dec = _enc
+    _expired = lambda x: False
+
 BASE = "https://student.tsinghua.edu.cn/v2/api"
+
+
+def _scrub(s):
+    """输出脱敏：把疑似 JWT（载荷/内容仍可从 payload 判断）替换为 <redacted>，避免 token 泄漏到输出/日志。"""
+    if s is None:
+        return s
+    import re
+    return re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "<redacted>", str(s))
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -183,16 +201,22 @@ def _save_jwt(tok):
     try:
         os.makedirs(JWT_SAVE_DIR, exist_ok=True)
         with open(JWT_SAVE, "w", encoding="utf-8") as f:
-            f.write(tok)
-    except Exception:
-        pass
+            f.write(_enc(tok))
+    except Exception as e:
+        # 加密失败（如 cryptography 装不上）时拒绝落明文，仅提示、本次内存使用
+        print("[提示] 登录态未保存（" + str(e) + "）；本次仅在内存中使用，不影响查询/申请。", file=sys.stderr)
 
 
 def _read_saved_jwt():
     try:
         if os.path.exists(JWT_SAVE):
+            # 保留约 7 天（与后端 jwt 有效期对齐）：文件修改时间距今超过该时长视为过期 → 删除并当未登录
+            if _expired(os.path.getmtime(JWT_SAVE) * 1000):
+                try: os.remove(JWT_SAVE)
+                except Exception: pass
+                return None
             with open(JWT_SAVE, "r", encoding="utf-8") as f:
-                return f.read().strip()
+                return _dec(f.read().strip()).strip()
     except Exception:
         pass
     return None
@@ -322,14 +346,14 @@ def cmd_jwt():
         print(json.dumps({"found": False}, ensure_ascii=False))
         return 2
     tok, payload = r
-    print(json.dumps({"found": True, "jwt": tok, "payload": payload}, ensure_ascii=False))
+    print(_scrub(json.dumps({"found": True, "jwt": tok, "payload": payload}, ensure_ascii=False)))
     return 0
 
 
 def cmd_list(j):
     st, data = _api("GET", "/activity/rooms", j)
     if st != 200:
-        print(json.dumps({"ok": False, "error": data}, ensure_ascii=False))
+        print(_scrub(json.dumps({"ok": False, "error": data}, ensure_ascii=False)))
         return 1
     rooms = data.get("value", [])
     if "--json" in sys.argv:
@@ -481,7 +505,7 @@ def cmd_recommend(jwt):
     location = kv.get("location")
     st, data = _api("GET", "/activity/rooms", jwt)
     if st != 200:
-        print(json.dumps({"ok": False, "error": data}, ensure_ascii=False))
+        print(_scrub(json.dumps({"ok": False, "error": data}, ensure_ascii=False)))
         return 1
     rooms = data.get("value", [])
     matches = []
@@ -581,7 +605,7 @@ def cmd_avail(jwt):
 
     st, data = _api("GET", "/activity/rooms", jwt)
     if st != 200:
-        print(json.dumps({"ok": False, "error": data}, ensure_ascii=False))
+        print(_scrub(json.dumps({"ok": False, "error": data}, ensure_ascii=False)))
         return 1
     rooms = data.get("value", [])
     matches = []
@@ -760,7 +784,7 @@ def cmd_apply(jwt):
         return 1
     st, data = _api("GET", "/activity/rooms", jwt)
     if st != 200:
-        print(json.dumps({"ok": False, "error": data}, ensure_ascii=False)); return 1
+        print(_scrub(json.dumps({"ok": False, "error": data}, ensure_ascii=False))); return 1
     roomobj = next((r for r in data.get("value", []) if r.get("name") == room or r.get("id") == room), None)
     if not roomobj:
         print(json.dumps({"ok": False, "error": "未找到房间 " + room}, ensure_ascii=False)); return 1

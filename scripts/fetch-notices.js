@@ -3,11 +3,12 @@ const os = require('os');
 const path = require('path');
 const HOME = os.homedir();
 const TOKEN_FILE = path.join(HOME, '.thu-lib-space', 'token.json');
+const cryptoLib = require('./lib/crypto.js');
 const STORAGE = path.join(HOME, '.thu-lib-space', 'storage-state.json');
 const API_BASE = 'https://cab.lib.tsinghua.edu.cn/ic-web';
-const OUT = path.join(__dirname, '..', 'references', 'notices.md');
+const OUT = path.join(__dirname, '..', 'references', 'lib-space-notices.md');
 
-const token = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')).token;
+const token = JSON.parse(cryptoLib.decrypt(fs.readFileSync(TOKEN_FILE, 'utf8'))).token;
 let cookie = '';
 try { const s = JSON.parse(fs.readFileSync(STORAGE, 'utf8')); cookie = (s.cookies || []).map((c) => `${c.name}=${c.value}`).join('; '); } catch {}
 

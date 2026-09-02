@@ -9,9 +9,10 @@ thu-auto-reserve/
 ├── SKILL.md                    # 主文件（Agent Skills 规范，必读；含「判断用户意图」分流）
 ├── README.md                   # 用户向说明（功能总览 / 特点 / 使用须知）
 ├── DEVELOPER.md                # 本文件（开发者 / 维护）
-├── CHANGELOG.md                # 版本更新日志（v1.0.0 为首个正式版）
+├── CHANGELOG.md                # 版本更新日志（v1.0.0 首个正式版，最新 v1.1.0）
+├── requirements.txt            # Python 依赖（cryptography；wechat-room-api.py 缺失时也会自动 pip 安装）
 ├── references/
-│   ├── api.md                  # 体育场馆 API 逆向参考（认证/签名/解密/接口/路由）【本人】
+│   ├── venue-api.md             # 体育场馆 API 逆向参考（认证/签名/解密/接口/路由）【本人】
 │   ├── venues.md               # 清华各体育场馆信息【本人】
 │   ├── mini-program.md         # 学生清华小程序·活动室申请（逆向笔记/数据）【本人】
 │   ├── activity-rooms.md       # 全部 51 个活动室目录【本人】
@@ -30,7 +31,10 @@ thu-auto-reserve/
     ├── wechat-room.py          # 学生活动室 UI 兜底【本人】
     ├── space-helper.js         # 图书馆 IC 空间【伙伴1】
     ├── fetch-notices.js        # 图书馆通知抓取【伙伴1】
-    └── seat-helper.js          # 图书馆自习座位【伙伴2】
+    ├── seat-helper.js          # 图书馆自习座位【伙伴2】
+    └── lib/
+        ├── crypto.js           # 会话文件加密（Node，AES-256-GCM）【本人】
+        └── crypto.py           # 会话文件加密（Python，cryptography 必装/缺失自动装）【本人】
 ```
 
 ## 快速使用（命令参考）
@@ -169,7 +173,7 @@ node scripts/seat-helper.js cancel --id <取消id> --yes
 
 | 来源 | 文件 | 功能 |
 |------|------|------|
-| 本人（thu-auto-reserve） | `scripts/venue-helper.js`、`references/api.md` / `references/venues.md` | 体育场馆 |
+| 本人（thu-auto-reserve） | `scripts/venue-helper.js`、`references/venue-api.md` / `references/venues.md` | 体育场馆 |
 | 本人（thu-auto-reserve） | `scripts/wechat-room-api.py` / `scripts/wechat-room.py`、`references/wechat-room-api.md` / `references/activity-rooms.md` / `references/mini-program.md` | 学生活动室 |
 | 合作伙伴（thu-auto-reserve-1 = thu-lib-space-reserve） | `scripts/space-helper.js` / `scripts/fetch-notices.js`、`references/lib-space-*.md` | 图书馆 IC 空间 |
 | 合作伙伴（thu-auto-reserve-2 = thu-lib-seat-reserve） | `scripts/seat-helper.js`、`references/lib-seat-*.md` | 图书馆自习座位 |
@@ -194,21 +198,25 @@ node scripts/seat-helper.js cancel --id <取消id> --yes
 
 ## 打包提交
 
-本目录即一个标准 Agent Skill（`SKILL.md` 为必需）。提交到技能广场时，把 **`thu-auto-reserve` 目录**整体打包成 `thu-auto-reserve.zip`（zip 解压后应直接得到 `thu-auto-reserve/SKILL.md`，不要多套一层父目录）。
+本目录即一个标准 Agent Skill（`SKILL.md` 为必需）。提交到技能广场时，把**本目录的内容**（`SKILL.md`、`scripts/`、`references/` 等）整体打包成 `thu-auto-reserve.zip`：**zip 根目录直接就是技能内容**（`SKILL.md` 位于 zip 根，不要再套一层 `thu-auto-reserve/` 文件夹）；路径一律用**正斜杠**，并**显式写入目录条目**；排除 `.git/`、`node_modules/`、`submission/`。
 
 ## 说明与限制
 
 - 登录走清华统一身份认证（SSO），必须由用户本人在浏览器完成。
 - 支付为微信/支付宝扫码，必须由用户本人在可见浏览器完成。
 - 可预约时段实时变化，预约前建议重新查询。
-- 接口/签名/解密细节见 `references/api.md`；脚本已实现签名与 AES 解密，日常无需手工调用。
+- 接口/签名/解密细节见 `references/venue-api.md`；脚本已实现签名与 AES 解密，日常无需手工调用。
 - 体育场馆「取消预约」有提前 24 小时硬限制（`cancelBeforeStartTime=1440` 分钟）；`cancel` 命令已实测。
 - 活动室「单次≤2h、每日1次」是使用/审核规范（非接口硬约束）；申请字段规则、位置规则（胜因院 9-21/≥3天）等见 `references/wechat-room-api.md`。
-- 开发迭代中的可复用经验（认证/字段语义/预约逻辑/错误处理/UX 等 58 条）见 `references/lessons.md`。
+- 开发迭代中的可复用经验（认证/字段语义/预约逻辑/错误处理/UX 等 62 条）见 `references/lessons.md`。
+- **安全设计考量（有意做成这样，详见 `SKILL.md`「安全设计考量」）**：
+  - **会话/令牌加密 + 留存约 7 天（与后端 jwt 有效期对齐）**：保存到 `~/.thu-*` 的 token/会话/JWT 用 `scripts/lib/crypto`（AES-256-GCM，密钥按本机 hostname+用户名派生）加密；本地保留约 7 天，到期按未登录处理并清理（`storage-state.json` 与 `browser-profile/` 不在加密范围）。
+  - **token 不外泄**：输出/日志/错误经 `scrub` 脱敏（已知密钥 + 疑似 JWT → `<redacted>`）；token 只在 HTTP 头、不走命令行。
+  - **如实申报、不作弊**；**每次真实动作前明确确认**；**依赖固定** playwright `1.62.1`。
 
 ## lessons.md 逐条核对（对图书馆两分支的适用性）
 
-> 合并时逐条检查了 `references/lessons.md` 的 50 条合作伙伴经验（#1-50）；绝大部分已应用，仅补了 #41「每步告知/提交后告知」与全局「沟通原则」覆盖。核对结论如下（按 lessons.md 主题分组；**#51-58 为本 skill 迭代后新增**，非合作伙伴经验）：
+> 合并时逐条检查了 `references/lessons.md` 的 50 条合作伙伴经验（#1-50）；绝大部分已应用，仅补了 #41「每步告知/提交后告知」与全局「沟通原则」覆盖。核对结论如下（按 lessons.md 主题分组；**#51-62 为本 skill 迭代后新增**，非合作伙伴经验）：
 
 | lessons.md 主题 | 适用性（图书馆两分支） | 状态 |
 |---|---|---|
@@ -225,4 +233,4 @@ node scripts/seat-helper.js cancel --id <取消id> --yes
 | 十一 脚本健壮性（#44-47） | ✅ 适用（npm 对象格式、Chrome/Edge 优先） | 已应用 |
 | 十二 流程标准化（#48-50） | ✅ 适用（固定流程、软提示、开场告知） | 已应用 |
 
-> 结论：合作伙伴 skill 质量较高，50 条经验中仅 #41 需显式补充、#39/#40 不适用于图书馆场景；#37 提问框已在图书馆研讨间采用。其余均已落实。**#51-58（数字与选项区分 / 排查不暴露命令·函数名 / 时间可行性先校验 / 提示按真实规则 / 0 结果提示 / 成员去重 / 口径改变后同步文档 / 房间名简称匹配）为本 skill 迭代新增，已在 SKILL 与脚本落实。**
+> 结论：合作伙伴 skill 质量较高，50 条经验中仅 #41 需显式补充、#39/#40 不适用于图书馆场景；#37 提问框已在图书馆研讨间采用。其余均已落实。**#51-62（数字与选项区分 / 排查不暴露命令·函数名 / 时间可行性先校验 / 提示按真实规则 / 0 结果提示 / 成员去重 / 口径改变后同步文档 / 房间名简称匹配 / 静态凭证加密+留存合理 / 如实申报不作弊 / 具体日期用--date单日查 / 沙箱先预检先提权）为本 skill 迭代新增，已在 SKILL 与脚本落实。**

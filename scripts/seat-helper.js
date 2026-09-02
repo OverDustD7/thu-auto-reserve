@@ -12,7 +12,7 @@
  *   status                        检查登录态（退出码 0=已登录 / 2=未登录）
  *
  * 浏览器命令（需要 playwright）：
- *   setup                         首次准备（建 package.json → npm install playwright → 按需装浏览器）
+ *   setup                         首次准备（建 package.json → npm install（固定 1.62.1）→ 按需装浏览器）
  *   login                         登录（SSO，弹出可见浏览器；已登录则复用）
  *   open   --lib <id>              打开「选楼层」页
  *   open   --floor <id> [--date]   打开「选阅览区/日期」页
@@ -32,6 +32,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const cryptoLib = require('./lib/crypto'); // 会话文件加密（最小改动，防文件被拷走；storage-state/browser-profile 暂不加密）
 
 const BASE = 'https://seat.lib.tsinghua.edu.cn';
 const HOME_DIR = path.join(os.homedir(), '.thu-lib-seat');
@@ -57,7 +58,7 @@ const SEAT_STATUS = {
 // 预约成功后的精简提醒（签到时限 + 取消限额）
 const BOOK_REMIND = '预约成功后 30 分钟内刷门禁签到，否则记违规；取消预约每日限 1 次';
 
-// 馆舍简介（体现特色功能，与 references/seats.md 二 对齐，来源为各馆官网）
+// 馆舍简介（体现特色功能，与 references/lib-seat-seats.md 二 对齐，来源为各馆官网）
 const LIB_INTRO = {
   35: '总馆北馆（李文正馆）：15000㎡、藏书 60 余万册、900 余坐席，一至五层开架；G 层古籍阅览室 + 邺架轩书店',
   64: '总馆西馆（逸夫馆）：理工/科技/医药/建筑/计算机专业图书主藏，另有现刊报纸阅览区',
@@ -67,7 +68,7 @@ const LIB_INTRO = {
   29: '金融图书馆（五道口金融学院内）：1200㎡、约 100 坐席、11 万藏书；开架区 + 地下书库，经济金融类为主',
 };
 
-// 楼层设施简介（体现各楼层功能分区，与 references/seats.md 二 对齐；未列出的楼层以接口返回的阅览区为准）
+// 楼层设施简介（体现各楼层功能分区，与 references/lib-seat-seats.md 二 对齐；未列出的楼层以接口返回的阅览区为准）
 const FLOOR_FACILITIES = {
   36: '总服务台、自助借还/文印、图书杀菌等服务区',
   37: '开架图书阅览区：A/B/C/D/E 区 + 连廊（普通自习座）',
@@ -126,7 +127,9 @@ function ensureDir(dir) {
 
 function loadSession() {
   try {
-    return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+    const s = JSON.parse(cryptoLib.decrypt(fs.readFileSync(SESSION_FILE, 'utf8')));
+    if (s && cryptoLib.isExpired(s.updatedAt)) { try { fs.unlinkSync(SESSION_FILE); } catch {} return null; }
+    return s;
   } catch {
     return null;
   }
@@ -134,7 +137,7 @@ function loadSession() {
 
 function saveSession(s) {
   ensureDir(HOME_DIR);
-  fs.writeFileSync(SESSION_FILE, JSON.stringify({ ...s, updatedAt: new Date().toISOString() }, null, 2));
+  fs.writeFileSync(SESSION_FILE, cryptoLib.encrypt(JSON.stringify({ ...s, updatedAt: new Date().toISOString() }, null, 2)));
 }
 
 // 组装完整 cookie 串：新格式 session.cookie 已含 access_token=；旧格式只有 PHPSESSID，则合并 storage-state.json 补齐
@@ -187,12 +190,15 @@ async function restoreContextCookies(context) {
 }
 
 function out(obj, json) {
-  if (json) console.log(JSON.stringify(obj));
-  else console.log(obj);
+  // 输出脱敏：token/cookie 替换为 <redacted>，避免泄漏到 stdout
+  const scr = (s) => { const r = loadSession(); return cryptoLib.scrub(s, [r && r.access_token, r && r.cookie]); };
+  if (json) console.log(scr(JSON.stringify(obj)));
+  else console.log(scr(obj));
 }
 
 function err(msg, code = 1) {
-  console.error(msg);
+  const r = loadSession();
+  console.error(cryptoLib.scrub(msg, [r && r.access_token, r && r.cookie]));
   process.exit(code);
 }
 
@@ -457,7 +463,7 @@ function launchPersistent() {
       } catch (e) {
         // 浏览器存在但被沙箱拦截（spawn EPERM）→ 立即提示升级权限，不继续回退、不装 Chromium
         if (/EPERM|permission|not permitted/i.test(String((e && e.message) || e))) {
-          err('启动系统浏览器被沙箱拦截（spawn EPERM）：系统 Edge/Chrome 存在但无法启动。请直接以更宽权限（danger-full-access）重试本命令；不要安装 Chromium。');
+          err('启动系统浏览器被沙箱拦截（spawn EPERM）：系统 Edge/Chrome 存在但无法启动。请下次运行前先以更宽权限（danger-full-access）提权再运行本命令；不要安装 Chromium。');
         }
         // 其它原因（如未安装该浏览器）→ 尝试下一个
       }
@@ -466,9 +472,9 @@ function launchPersistent() {
       return await chromium.launchPersistentContext(PROFILE_DIR, base);
     } catch (e) {
       if (/EPERM|permission|not permitted/i.test(String((e && e.message) || e))) {
-        err('启动浏览器被沙箱拦截（spawn EPERM）。请直接以更宽权限（danger-full-access）重试本命令；不要安装 Chromium。');
+        err('启动浏览器被沙箱拦截（spawn EPERM）。请下次运行前先以更宽权限（danger-full-access）提权再运行本命令；不要安装 Chromium。');
       }
-      err('启动浏览器失败：' + ((e && e.message) || String(e)) + '（优先用系统 Edge/Chrome；若为沙箱拦截 spawn EPERM，请以 danger-full-access 重试，不要安装 Chromium）');
+      err('启动浏览器失败：' + ((e && e.message) || String(e)) + '（优先用系统 Edge/Chrome；若为沙箱拦截 spawn EPERM，请下次运行前先以 danger-full-access 提权再运行，不要安装 Chromium）');
     }
   })();
 }
@@ -687,10 +693,10 @@ async function cmdSetup(opt) {
   const pkgPath = path.join(skillRoot, 'package.json');
   const pkg = {
     name: 'thu-lib-seat-reserve',
-    version: '1.0.0',
+    version: '1.1.0',
     private: true,
     allowScripts: { playwright: true },
-    dependencies: { playwright: '^1.62.1' },
+    dependencies: { playwright: '1.62.1' },
   };
   fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
   console.log(`已写入 ${pkgPath}（allowScripts 为对象格式）`);

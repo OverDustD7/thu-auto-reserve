@@ -35,7 +35,7 @@
  *   1) 在 skill 根目录建 package.json，且 allowScripts 必须是对象格式 {"playwright": true}
  *      （写成数组 ["playwright"] 会被 npm 解析成 {"0":"playwright"} 这类错键，不生效）
  *   2) 安装前移除环境变量 npm_config_allow_scripts（DSH harness 注入的 allow-scripts 白名单会干扰 npm 11）
- *   3) npm install playwright
+ *   3) npm install（按 package.json 固定 1.62.1 安装 playwright）
  *   4) 浏览器优先用系统已装的 Chrome/Edge（无需下载）；都没有时才 npx playwright install chromium，
  *      并可用 PLAYWRIGHT_DOWNLOAD_HOST / --mirror 指定镜像加速
  */
@@ -46,6 +46,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const cryptoLib = require('./lib/crypto'); // 会话文件加密（最小改动，防文件被拷走；storage-state/browser-profile 暂不加密）
 
 const VENUE_URL = 'https://www.sports.tsinghua.edu.cn/venue/';
 const API_BASE = 'https://www.sports.tsinghua.edu.cn/venue/site';
@@ -116,11 +117,15 @@ function fmtDate(d) {
 }
 
 function readTokenFile() {
-  try { return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')); } catch { return null; }
+  try {
+    const o = JSON.parse(cryptoLib.decrypt(fs.readFileSync(TOKEN_FILE, 'utf8')));
+    if (o && cryptoLib.isExpired(o.updatedAt)) { try { fs.unlinkSync(TOKEN_FILE); } catch {} return null; }
+    return o;
+  } catch { return null; }
 }
 function writeTokenFile(obj) {
   fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify(obj, null, 2));
+  fs.writeFileSync(TOKEN_FILE, cryptoLib.encrypt(JSON.stringify(obj, null, 2)));
 }
 
 /** 读取场景上下文缓存（devKind/building/sceneUseType，按 sceneUuid 键） */
@@ -154,15 +159,17 @@ function parseArgs(argv) {
 
 /** 统一输出：--json 时输出单行 JSON，否则输出人类可读文本；随后按退出码退出 */
 function output(result, json) {
+  // 输出脱敏：token/Cookie 替换为 <redacted>，避免泄漏到 stdout/stderr/日志
+  const scr = (s) => { const t = readTokenFile(); return cryptoLib.scrub(s, [t && t.token]); };
   if (json) {
     const o = { ok: result.code === EXIT_OK, code: result.code };
     if (result.message !== undefined) o.message = result.message;
     if (result.data !== undefined) o.data = result.data;
-    console.log(JSON.stringify(o));
+    console.log(scr(JSON.stringify(o)));
   } else {
-    if (result.code !== EXIT_OK) console.error('[错误] ' + (result.message || '失败'));
-    else if (result.text !== undefined) console.log(result.text);
-    else if (result.data !== undefined) console.log(JSON.stringify(result.data, null, 2));
+    if (result.code !== EXIT_OK) console.error(scr('[错误] ' + (result.message || '失败')));
+    else if (result.text !== undefined) console.log(scr(result.text));
+    else if (result.data !== undefined) console.log(scr(JSON.stringify(result.data, null, 2)));
   }
   process.exit(result.code);
 }
@@ -204,6 +211,10 @@ async function launchContext(headless) {
   try {
     return await chromium.launchPersistentContext(PROFILE_DIR, base);
   } catch (e) {
+    if (/EPERM|permission|not permitted/i.test(String((e && e.message) || (lastErr && lastErr.message) || ''))) {
+      console.error('[错误] 启动浏览器被沙箱拦截（spawn EPERM）：系统 Chrome/Edge 存在但无法启动。请下次运行前先以更宽权限（danger-full-access）提权再运行；不要安装 Chromium。');
+      throw lastErr || e;
+    }
     console.error('[错误] 未能启动浏览器。请确认已安装 Google Chrome 或 Microsoft Edge，');
     console.error('  或执行： node scripts/venue-helper.js setup --with-chromium');
     throw lastErr || e;
@@ -1033,10 +1044,13 @@ function ensurePackageJson() {
   try { pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')); } catch { pkg = {}; }
   if (typeof pkg !== 'object' || Array.isArray(pkg)) pkg = {};
   if (!pkg.name) pkg.name = 'thu-auto-reserve';
-  if (!pkg.version) pkg.version = '1.0.0';
+  if (!pkg.version) pkg.version = '1.1.0';
   pkg.private = true;
   const prev = (pkg.allowScripts && typeof pkg.allowScripts === 'object' && !Array.isArray(pkg.allowScripts)) ? pkg.allowScripts : {};
   pkg.allowScripts = { ...prev, playwright: true }; // 对象格式：{"playwright": true}
+  // 固定 playwright 版本（避免安装时拉到不同版本）
+  if (!pkg.dependencies || typeof pkg.dependencies !== 'object' || Array.isArray(pkg.dependencies)) pkg.dependencies = {};
+  pkg.dependencies.playwright = '1.62.1';
   fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
   return pkgPath;
 }
@@ -1055,8 +1069,8 @@ async function cmdSetup(argv) {
     steps.push('package.json');
 
     if (!json) console.log('② 安装 playwright 库（已移除 npm_config_allow_scripts）…');
-    if (!runShell('npm install playwright')) {
-      return output({ code: EXIT_FAIL, message: 'npm install playwright 失败，请检查网络或手动执行' }, json);
+    if (!runShell('npm install')) {
+      return output({ code: EXIT_FAIL, message: 'npm install 失败，请检查网络或手动执行' }, json);
     }
     steps.push('playwright');
 
