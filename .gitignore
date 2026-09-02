@@ -1,0 +1,14 @@
+# —— 依赖（由 setup 生成，不入库）——
+node_modules/
+.npm-cache/
+
+# —— 打包 / 临时产物 ——
+*.zip
+*.log
+
+# —— 操作系统 ——
+.DS_Store
+Thumbs.db
+
+# —— 参赛 / 演示材料（图标、示例图视频；如需入库，删除下一行）——
+submission/

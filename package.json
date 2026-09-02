@@ -1,0 +1,11 @@
+{
+  "name": "thu-auto-reserve",
+  "version": "1.0.0",
+  "private": true,
+  "allowScripts": {
+    "playwright": true
+  },
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}
