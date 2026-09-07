@@ -1,30 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-wechat-room-api.py -- 学生清华·活动室申请 直连 API 客户端
-从运行中的微信(WeChatAppEx)进程内存提取 jwt，直连 student.tsinghua.edu.cn/v2/api。
+"""学生清华活动室 API 客户端（Windows，Python 3.10+）。
 
-用法：
-  python wechat-room-api.py check                    # 检查前置：有效登录态(jwt)/微信/小程序窗口
-  python wechat-room-api.py jwt                      # 从微信进程内存提取当前 jwt
-  python wechat-room-api.py list [--json]            # 一次列出全部活动室(51间)
-  python wechat-room-api.py occupancy <房间名|id> [--json]  # 查某活动室的占用记录
-  python wechat-room-api.py recommend --capacity N --type 关键词 [--json]  # 按容量/用途/位置推荐
-  python wechat-room-api.py avail --capacity N --type 关键词 --from D --to D [--json]  # 指定区间可约时段
-  python wechat-room-api.py apply --room 名 --date D --start T --end T --organizer 主办方 --participants N [--yes]  # 提交申请(默认dry-run)
-  python wechat-room-api.py cancel --ticket <ticketId>   # 撤销申请（并自动删除撤销后回到草稿箱的草稿）
-  python wechat-room-api.py remove --ticket <ticketId>   # 删除草稿（清草稿箱）
-  python wechat-room-api.py mine [--json]            # 列出我的申请（申请中/被拒，不含草稿箱）
-  python wechat-room-api.py drafts [--json]          # 列出草稿箱
-  python wechat-room-api.py config org <主办方>       # 保存主办方（apply 未给 --organizer 时自动复用）
-  python wechat-room-api.py config org [get]         # 读取已存主办方
-
-说明：
-  - 鉴权：Authorization: Bearer <jwt>；jwt 从微信进程(主/网络进程)内存按 ASCII 提取，失败回退本地保存(~7天过期)。
-  - API 直连，无需小程序窗口常开；jwt 约 7 天过期，过期时在微信里打开「学生清华」小程序刷新一次。
-  - 退出码：0 成功 / 1 失败 / 2 无有效登录态(jwt)。
+登录：login --card 学工号（终端隐藏输入）；受信任集成可使用 --stdin。
+检查/退登：check | logout。查询不扫描微信进程，不输出凭证。
+查询：list | recommend | occupancy 房间 | avail --from YYYY-MM-DD --to YYYY-MM-DD
+申请：apply --room 房间 --date YYYY-MM-DD --start HH:mm --end HH:mm
+      --organizer 主办方 --participants 人数 --subject 主题 --usage 内容 --type 类型 [--yes]
+撤销/删除：cancel --ticket ID [--yes] | remove --ticket ID [--yes]
+列表：mine | drafts。主办方：config org 名称 | config org get。
+所有写预约操作默认预演；显式 --yes 才执行；--dry-run 与 --yes 不可同时使用。
+退出码：0 成功，1 失败，2 无有效会话。凭证通过 Windows DPAPI 保存，最长七天。
 """
-import ctypes
 import json
 import os
 import re
@@ -32,27 +19,46 @@ import sys
 import time
 import urllib.request
 import urllib.parse
-from ctypes import wintypes
+import urllib.error
+import datetime as dt
+import builtins
+import getpass
+import math
 
-# 会话加密：从 scripts/lib/crypto.py 导入（AES-256-GCM；cryptography 缺失时自动 pip 安装，装不上则拒绝明文保存）
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
-try:
-    from crypto import encrypt as _enc, decrypt as _dec, is_expired as _expired
-except Exception:
-    def _enc(x):
-        raise RuntimeError("会话加密模块加载失败，拒绝以明文保存登录态。")
-    _dec = _enc
-    _expired = lambda x: False
+# Fail closed: encryption is part of the shipped runtime, never auto-installed.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
+from crypto import encrypt as _enc, decrypt as _dec, is_expired as _expired
+BJ = dt.timezone(dt.timedelta(hours=8))
+_SECRETS = set()
 
 BASE = "https://student.tsinghua.edu.cn/v2/api"
 
 
 def _scrub(s):
-    """输出脱敏：把疑似 JWT（载荷/内容仍可从 payload 判断）替换为 <redacted>，避免 token 泄漏到输出/日志。"""
     if s is None:
         return s
-    import re
-    return re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "<redacted>", str(s))
+    text = str(s)
+    for secret in sorted(_SECRETS, key=len, reverse=True):
+        text = text.replace(secret, '<redacted>')
+    return re.sub(r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '<redacted>', text)
+
+def print(*args, **kwargs):
+    builtins.print(*[_scrub(x) for x in args], **kwargs)
+
+def _now():
+    return dt.datetime.now(BJ)
+
+def _confirmed():
+    if '--yes' in sys.argv and '--dry-run' in sys.argv:
+        raise ValueError('--yes 与 --dry-run 不能同时使用')
+    return '--yes' in sys.argv
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, '拒绝携带凭证重定向', headers, fp)
+
+_HTTP = urllib.request.build_opener(_NoRedirect)
+
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -61,123 +67,10 @@ except Exception:
     pass
 
 
-# ---------------- 进程内存读取（提取 jwt） ----------------
-class MBI(ctypes.Structure):
-    _fields_ = [("BaseAddress", ctypes.c_void_p), ("AllocationBase", ctypes.c_void_p),
-                ("AllocationProtect", ctypes.c_ulong), ("RegionSize", ctypes.c_size_t),
-                ("State", ctypes.c_ulong), ("Protect", ctypes.c_ulong), ("Type", ctypes.c_ulong)]
-
-
-def _get_cmdline(pid):
-    """用 NtQueryInformationProcess(ProcessCommandLine) 取进程命令行。纯 ctypes，无子进程。"""
-    kernel32 = ctypes.windll.kernel32
-    ntdll = ctypes.windll.ntdll
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not h:
-        return ""
-
-    class UNICODE_STRING(ctypes.Structure):
-        _fields_ = [("Length", ctypes.c_ushort), ("MaximumLength", ctypes.c_ushort),
-                    ("Buffer", ctypes.c_void_p)]
-
-    u = UNICODE_STRING()
-    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
-    ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int,
-                                                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
-    st = ntdll.NtQueryInformationProcess(h, 60, ctypes.byref(u), ctypes.sizeof(u), None)
-    kernel32.CloseHandle(h)
-    if st != 0 or not u.Buffer:
-        return ""
-    try:
-        return ctypes.wstring_at(u.Buffer)
-    except Exception:
-        return ""
-
-
-def _wechatappex_pids():
-    """Toolhelp32 进程快照：列出所有 WeChatAppEx.exe 的 [{pid, cmdline}]。无子进程，沙箱可用。"""
-    kernel32 = ctypes.windll.kernel32
-    TH32CS_SNAPPROCESS = 0x2
-    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    kernel32.Process32FirstW.restype = wintypes.BOOL
-    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
-    kernel32.Process32NextW.restype = wintypes.BOOL
-    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
-                    ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_size_t),
-                    ("th32ModuleID", ctypes.c_ulong), ("cntThreads", ctypes.c_ulong),
-                    ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
-
-    h = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if not h:
-        return []
-    out = []
-    entry = PROCESSENTRY32W()
-    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-    if kernel32.Process32FirstW(h, ctypes.byref(entry)):
-        while True:
-            if entry.szExeFile.lower() == "wechatappex.exe":
-                out.append({"pid": entry.th32ProcessID, "cmdline": _get_cmdline(entry.th32ProcessID)})
-            if not kernel32.Process32NextW(h, ctypes.byref(entry)):
-                break
-    kernel32.CloseHandle(h)
-    return out
-
-
-def _gather(pid):
-    kernel32 = ctypes.windll.kernel32
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.VirtualQueryEx.restype = ctypes.c_size_t
-    kernel32.VirtualQueryEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
-                                        ctypes.POINTER(MBI), ctypes.c_size_t]
-    kernel32.ReadProcessMemory.restype = wintypes.BOOL
-    kernel32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
-                                           ctypes.c_void_p, ctypes.c_size_t,
-                                           ctypes.POINTER(ctypes.c_size_t)]
-    PROCESS_VM_READ = 0x0010
-    PROCESS_QUERY_INFORMATION = 0x0400
-    MEM_COMMIT = 0x1000
-    h = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
-    if not h:
-        return None
-    chunks = []
-    addr = 0
-    mbi = MBI()
-    max_addr = 0x7FFFFFFFFFFF
-    while addr < max_addr:
-        if kernel32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi),
-                                   ctypes.sizeof(mbi)) == 0:
-            break
-        base = mbi.BaseAddress or 0
-        size = mbi.RegionSize or 0
-        if (mbi.State == MEM_COMMIT and size > 0
-                and not (mbi.Protect & 0x100) and mbi.Protect != 0x01
-                and (mbi.Protect & 0x04) and size < 0x2000000):
-            buf = ctypes.create_string_buffer(size)
-            read = ctypes.c_size_t(0)
-            if kernel32.ReadProcessMemory(h, ctypes.c_void_p(base), buf, size,
-                                          ctypes.byref(read)):
-                chunks.append(buf.raw[:read.value])
-        addr = base + max(size, 1)
-    kernel32.CloseHandle(h)
-    return b"".join(chunks)
-
-
 # ---------------- jwt 保存/兜底 ----------------
 JWT_SAVE_DIR = os.path.join(os.path.expanduser("~"), ".thu-sports-venue")
 JWT_SAVE = os.path.join(JWT_SAVE_DIR, "wechat-room-jwt.txt")
-_JWT_SOURCE = None   # "live"=实时内存提取 / "saved"=兜底复用 / None=无
+_JWT_SOURCE = None   # "saved"=显式导入后复用 / None=无
 
 
 def _decode_jwt(tok):
@@ -193,98 +86,85 @@ def _decode_jwt(tok):
 
 
 def _jwt_not_expired(obj):
-    exp = obj.get("exp")
-    return bool(exp) and exp > time.time()
+    exp = obj.get('exp') if isinstance(obj, dict) else None
+    return isinstance(exp, (int, float)) and math.isfinite(exp) and exp > time.time()
 
+def _target_payload(tok, expected_card):
+    obj = _decode_jwt(tok)
+    if not isinstance(obj, dict) or not expected_card or str(obj.get('card', '')) != str(expected_card):
+        raise ValueError('登录态与指定学工号不匹配')
+    if not isinstance(obj.get('openId'), str) or not obj['openId'] or not _jwt_not_expired(obj):
+        raise ValueError('不是可用的学生清华登录态')
+    issued = obj.get('iat')
+    if not isinstance(issued, (int, float)) or not math.isfinite(issued) or issued > time.time() or obj['exp'] <= issued:
+        raise ValueError('登录态签发时间无效')
+    if obj.get('iss') and obj['iss'] not in ('student.tsinghua.edu.cn', BASE, 'https://student.tsinghua.edu.cn'):
+        raise ValueError('登录态发行方不匹配')
+    return obj
 
-def _save_jwt(tok):
+def _save_jwt(tok, card):
+    encrypted = _enc(json.dumps({'jwt':tok,'card':str(card),'updatedAt':time.time()*1000}))
+    os.makedirs(JWT_SAVE_DIR, exist_ok=True)
+    temp = JWT_SAVE + '.' + str(os.getpid()) + '.tmp'
     try:
-        os.makedirs(JWT_SAVE_DIR, exist_ok=True)
-        with open(JWT_SAVE, "w", encoding="utf-8") as f:
-            f.write(_enc(tok))
-    except Exception as e:
-        # 加密失败（如 cryptography 装不上）时拒绝落明文，仅提示、本次内存使用
-        print("[提示] 登录态未保存（" + str(e) + "）；本次仅在内存中使用，不影响查询/申请。", file=sys.stderr)
-
+        with open(temp, 'x', encoding='utf-8') as f:
+            f.write(encrypted)
+        os.replace(temp, JWT_SAVE)
+    finally:
+        if os.path.exists(temp):
+            os.remove(temp)
 
 def _read_saved_jwt():
+    if not os.path.exists(JWT_SAVE):
+        return None
     try:
-        if os.path.exists(JWT_SAVE):
-            # 保留约 7 天（与后端 jwt 有效期对齐）：文件修改时间距今超过该时长视为过期 → 删除并当未登录
-            if _expired(os.path.getmtime(JWT_SAVE) * 1000):
-                try: os.remove(JWT_SAVE)
-                except Exception: pass
-                return None
-            with open(JWT_SAVE, "r", encoding="utf-8") as f:
-                return _dec(f.read().strip()).strip()
+        with open(JWT_SAVE, encoding='utf-8') as f:
+            saved = json.loads(_dec(f.read()))
+        if _expired(saved.get('updatedAt')):
+            raise ValueError('登录态到期')
+        token = saved['jwt']
+        _target_payload(token, saved['card'])
+        _SECRETS.add(token)
+        return token
+    except RuntimeError:
+        raise
     except Exception:
-        pass
-    return None
-
-
-def _jwt_valid(tok):
-    """用只读接口校验 token 当前是否仍被服务端接受（旧 token 会被吊销，返回非 200）。"""
-    try:
-        req = urllib.request.Request(BASE + "/activity/rooms", headers={"Authorization": "Bearer " + tok})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status == 200
-    except Exception:
-        return False
-
-
-def extract_jwt():
-    """找当前有效的 JWT：先试已保存的（服务端校验），无效则扫内存候选并逐个用服务端过滤，取第一个有效。"""
-    global _JWT_SOURCE
-    # 0) 快路：已保存的 token 若服务端仍接受则直接复用
-    saved = _read_saved_jwt()
-    if saved:
-        obj = _decode_jwt(saved)
-        if obj and _jwt_not_expired(obj) and _jwt_valid(saved):
-            _JWT_SOURCE = "saved"
-            return saved, obj
-    procs = _wechatappex_pids()
-    if not procs:
-        print("未找到 WeChatAppEx.exe 进程（微信小程序未运行）", file=sys.stderr)
+        os.remove(JWT_SAVE)
         return None
 
-    def priority(p):
-        cmd = p["cmdline"]
-        if "--type=" not in cmd:
-            return 0                      # main
-        if "network.mojom" in cmd:
-            return 1                      # network service
-        return 5                          # 其它
+def _jwt_valid(tok):
+    st, data = _api('GET', '/activity/rooms', tok)
+    return st == 200 and isinstance(data, dict) and isinstance(data.get('value'), list)
 
-    procs.sort(key=lambda p: priority(p))
-    import base64
-    seen = set()
-    tested = 0
-    for p in procs[:25]:
-        pid = p["pid"]
-        if pid in seen:
-            continue
-        seen.add(pid)
-        data = _gather(pid)
-        if not data:
-            continue
-        for m in re.finditer(rb"eyJ[A-Za-z0-9_\-]{10,200}\.[A-Za-z0-9_\-]{10,300}\.[A-Za-z0-9_\-]{10,400}", data):
-            tok = m.group(0).decode("ascii")
-            if tok.count(".") != 2:
-                continue
-            obj = _decode_jwt(tok)
-            if not (isinstance(obj, dict) and ("card" in obj or "openId" in obj or "exp" in obj)):
-                continue
-            tested += 1
-            if tested > 40:               # 上限，避免过多校验请求
-                break
-            if _jwt_valid(tok):
-                _save_jwt(tok)
-                _JWT_SOURCE = "live"
-                return tok, obj
-        if tested > 40:
-            break
+def extract_jwt():
+    # Queries never inspect WeChat process memory or guess candidate credentials.
+    global _JWT_SOURCE
+    token = _read_saved_jwt()
+    if token and _jwt_valid(token):
+        _JWT_SOURCE = 'saved'
+        return token, _decode_jwt(token)
     _JWT_SOURCE = None
     return None
+
+def cmd_login(args):
+    kv = _parse_kv_args(args)
+    card = kv.get('card')
+    if not card or not re.fullmatch(r'[0-9A-Za-z]{4,32}', card):
+        raise ValueError('登录需要 --card 指定本人学工号')
+    token = sys.stdin.read().strip() if '--stdin' in args else getpass.getpass('请输入本人学生清华登录态（输入不显示）：').strip()
+    _SECRETS.add(token)
+    _target_payload(token, card)
+    if not _jwt_valid(token):
+        raise ValueError('学校接口未接受该登录态')
+    _save_jwt(token, card)
+    print(json.dumps({'ok':True,'card':card,'result':'登录态已保存'}, ensure_ascii=False))
+    return 0
+
+def cmd_logout():
+    if os.path.exists(JWT_SAVE):
+        os.remove(JWT_SAVE)
+    print(json.dumps({'ok':True,'result':'已清除活动室登录态'}, ensure_ascii=False))
+    return 0
 
 
 def _api(method, path, jwt, params=None, body=None):
@@ -298,7 +178,7 @@ def _api(method, path, jwt, params=None, body=None):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with _HTTP.open(req, timeout=20) as resp:
             raw = resp.read()
             if not raw:                       # 204 无内容：返回状态 + 空对象
                 return resp.status, {}
@@ -323,7 +203,7 @@ def _api_full(method, path, jwt, params=None, body=None):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with _HTTP.open(req, timeout=20) as resp:
             raw = resp.read()
             parsed = json.loads(raw.decode("utf-8")) if raw else {}
             ho = {k: v for k, v in resp.headers.items()}
@@ -470,7 +350,9 @@ def _date_allowed(loc, d):
     """某位置在某天是否可约：超出最多提前天数 or 不满足最短提前天数（如胜因院≥3天）则不可约。"""
     import datetime as dt
     r = _rule_for(loc)
-    days_ahead = (d - dt.date.today()).days
+    days_ahead = (d - _now().date()).days
+    if days_ahead < 0:
+        return False
     if days_ahead > r.get("max_days", 14):
         return False
     if r.get("min_advance_days", 0) and days_ahead < r["min_advance_days"]:
@@ -565,13 +447,15 @@ def cmd_recommend(jwt):
 
 
 # ---------------- avail：按需求 + 日期区间，返回匹配活动室的可约时段 ----------------
-def _epoch_ms(iso):
-    """ISO 字符串 -> UTC 毫秒时间戳"""
+def _epoch_ms(value):
     try:
-        import datetime as dt
-        dt_ = dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S.%fZ")
-        return int(dt_.replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
-    except Exception:
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            return int(value)
+        parsed = dt.datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            return None
+        return int(parsed.timestamp() * 1000)
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -597,7 +481,7 @@ def cmd_avail(jwt):
     purpose = kv.get("purpose")
     location = kv.get("location")
     import datetime as dt
-    today = dt.date.today()
+    today = _now().date()
     start = dt.date.fromisoformat(kv["from"]) if kv.get("from") else today
     end = dt.date.fromisoformat(kv["to"]) if kv.get("to") else (start + dt.timedelta(days=6))
     if end < start:
@@ -622,6 +506,8 @@ def cmd_avail(jwt):
             feats = PURPOSE_FEATURES.get(purpose, [purpose])
             if not any(f in txt for f in feats):
                 continue
+            if purpose not in SPECIALIZED_PURPOSES and _all_tags_specialized(r):
+                continue
         elif type_kw:
             kws = TYPE_ALIASES.get(type_kw, [type_kw])
             if not any(k in txt for k in kws):
@@ -641,25 +527,35 @@ def cmd_avail(jwt):
         if not allowed:
             continue    # 该位置规则不允许这段区间（如胜因院需提前≥3天、对明天不可约）→ 排除
         st2, rec = _api("GET", "/activity/rooms/%s/records" % r["id"], jwt)
-        recs = rec.get("value", []) if st2 == 200 else []
+        if st2 != 200 or not isinstance(rec, dict) or not isinstance(rec.get('value'), list):
+            raise RuntimeError('未能查询房间占用，不能判断可约')
+        recs = rec['value']
         day_map = {d: [] for d in allowed}
         for x in recs:
             s_ms = _epoch_ms(x.get("start", ""))
             e_ms = _epoch_ms(x.get("end", ""))
-            if s_ms is None or e_ms is None:
-                continue
-            bd = _bjd(s_ms)
-            if bd in day_map:
-                day_map[bd].append((s_ms, e_ms, x.get("status", "")))
+            if s_ms is None or e_ms is None or e_ms <= s_ms:
+                raise ValueError('占用记录时间无效，不能判断可约')
+            for day in day_map:
+                midnight = int(dt.datetime.combine(day, dt.time(), BJ).timestamp() * 1000)
+                if s_ms < midnight + 86400000 and e_ms > midnight:
+                    day_map[day].append((max(s_ms, midnight), min(e_ms, midnight + 86400000), x.get('status', '')))
         free_by_day = {}
         booked_by_day = {}
         for day in sorted(day_map):
             rcs = sorted(day_map[day])
-            cur = oh * 60
+            now = _now()
+            earliest = now + dt.timedelta(hours=rule.get('min_advance_h', 0))
+            if day < earliest.date():
+                free_by_day[day] = []
+                booked_by_day[day] = []
+                continue
+            cur = max(oh * 60, earliest.hour * 60 + earliest.minute + bool(earliest.second or earliest.microsecond)) if day == earliest.date() else oh * 60
             segs = []
             blist = []
             for s_ms, e_ms, status in rcs:
-                sm, em = _bjmin(s_ms), _bjmin(e_ms)
+                midnight = int(dt.datetime.combine(day, dt.time(), BJ).timestamp() * 1000)
+                sm, em = (s_ms-midnight)//60000, (e_ms-midnight+59999)//60000
                 if sm > cur:
                     segs.append((cur, min(sm, ch * 60)))
                 cur = max(cur, em)
@@ -707,55 +603,12 @@ def cmd_avail(jwt):
 
 
 # ---------------- 前置检查：微信进程 / 学生清华小程序窗口 / jwt ----------------
-def _mp_window_open():
-    """是否可见「学生清华」小程序窗口。"""
-    user32 = ctypes.windll.user32
-    found = {"ok": False}
-    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_void_p)
-
-    def cb(h, l):
-        if not user32.IsWindowVisible(h):
-            return True
-        b = ctypes.create_unicode_buffer(512)
-        user32.GetWindowTextW(h, b, 512)
-        if "学生清华" in b.value:
-            found["ok"] = True
-            return False
-        return True
-
-    user32.EnumWindows(WNDENUMPROC(cb), 0)
-    return found["ok"]
-
-
 def cmd_check():
-    """检查前置：登录态(jwt) 是否可用。查询/推荐/占用/可约/申请/撤销均为 API 直连，只需有效 jwt。
-    wechat_running / miniprogram_open 仅作为「是否需要重新登录刷新」的参考，不决定能否操作。"""
-    procs = _wechatappex_pids()
-    wechat = bool(procs)
-    mp = _mp_window_open()
-    jwt_res = extract_jwt()
-    jwt_ok = jwt_res is not None
-    jwt_src = _JWT_SOURCE
-    card = (jwt_res[1].get("card") if jwt_res else None)
-    status = {
-        "wechat_running": wechat, "miniprogram_open": mp,
-        "jwt_available": jwt_ok, "jwt_source": jwt_src, "card": card,
-        "ready_for_query": bool(jwt_ok),   # 查询/推荐/占用/可约：只需有效 jwt（无需微信窗口）
-        "ready_for_apply": bool(jwt_ok),   # 申请/撤销：也是 API，只需有效 jwt
-        "note": "查询/申请/撤销均为 API 直连，只需有效登录态(jwt)；jwt 由 wx.login 产生、约 7 天过期，过期需在微信里打开「学生清华」小程序一次以刷新。",
-    }
-    print(json.dumps(status, ensure_ascii=False))
-    if not jwt_ok:
-        print("→ 无有效登录态：请打开并登录 PC 微信 → 打开「学生清华」小程序确认已登录（脚本会自动获取并保存 jwt）。", file=sys.stderr)
-        return 2
-    if not wechat or not mp:
-        print("→ 登录态有效（%s）。微信/小程序当前未打开也没关系：查询/申请/撤销直接走 API 可用；"
-              "仅当 jwt 过期(~7天)时才需重新在微信里打开小程序刷新。" %
-              ("实时提取" if jwt_src == "live" else "复用已保存"), file=sys.stderr)
-    else:
-        print("✔ 已登录（%s），微信 + 学生清华小程序均在，可直接使用。" %
-              ("实时提取" if jwt_src == "live" else "复用已保存"), file=sys.stderr)
-    return 0
+    r = extract_jwt()
+    print(json.dumps({'ready_for_query':bool(r),'ready_for_apply':bool(r),'jwt_source':_JWT_SOURCE,
+        'card':r[1].get('card') if r else None,
+        'note':'查询不扫描微信进程；未登录时先使用 login --card 导入本人登录态'}, ensure_ascii=False))
+    return 0 if r else 2
 
 
 # ---------------- apply：直接 POST /activity/room-tickets 提交申请（高度自动化） ----------------
@@ -773,13 +626,13 @@ def _bj_ms(d, t):
 
 def cmd_apply(jwt):
     kv = _parse_kv_args(sys.argv[2:])
-    yes = "--yes" in sys.argv
+    yes = _confirmed()
     room = kv.get("room"); date = kv.get("date"); start = kv.get("start"); end = kv.get("end")
     organizer = kv.get("organizer") or _load_org(); participants = kv.get("participants")
-    subject = kv.get("subject", "无"); usage = kv.get("usage", "无")
+    subject = kv.get("subject", "").strip(); usage = kv.get("usage", "").strip()
     atype = kv.get("type", "sports"); atype = TYPE_MAP.get(atype, atype)
     target = kv.get("target", "school")
-    if not all([room, date, start, end, organizer, participants]):
+    if not all([room, date, start, end, organizer, participants, subject, usage]):
         print(json.dumps({"ok": False, "error": "缺少必填：--room --date --start --end --organizer（或 config org 已存）--participants"}, ensure_ascii=False))
         return 1
     st, data = _api("GET", "/activity/rooms", jwt)
@@ -789,11 +642,13 @@ def cmd_apply(jwt):
     if not roomobj:
         print(json.dumps({"ok": False, "error": "未找到房间 " + room}, ensure_ascii=False)); return 1
     st_s, sem = _api("GET", "/account/semesters", jwt)
-    semesters = sem if isinstance(sem, list) else (sem or {}).get("value", [])
+    if st_s != 200 or not isinstance(sem, (list, dict)):
+        raise RuntimeError('学期查询失败，已停止预约')
+    semesters = sem if isinstance(sem, list) else sem.get('value', [])
     def _in_sem(s):
         s0 = (s.get("start") or ""); s1 = (s.get("end") or "")
-        return (s0[:10] <= date <= s1[:10]) if (s0 and s1) else True
-    semester = next((s for s in semesters if _in_sem(s)), semesters[0] if semesters else None)
+        return bool(s0 and s1 and s0[:10] <= date <= s1[:10])
+    semester = next((s for s in semesters if _in_sem(s)), None)
     if not semester or not semester.get("id"):
         print(json.dumps({"ok": False, "error": "未取到学期"}, ensure_ascii=False)); return 1
     # 校验：参与人数为数字且 ≤ 房间容量；时长 ≤2h（软约束提示）
@@ -802,55 +657,70 @@ def cmd_apply(jwt):
         pnum = int(participants)
     except Exception:
         print(json.dumps({"ok": False, "error": "参与人数必须是数字"}, ensure_ascii=False)); return 1
+    if pnum <= 0:
+        raise ValueError('参与人数必须为正整数')
     if cap and pnum > cap:
         print(json.dumps({"ok": False, "error": "参与人数(%d)超过房间容量(%d)" % (pnum, cap)}, ensure_ascii=False)); return 1
-    dur_h = (_bj_ms(date, end) - _bj_ms(date, start)) / 3600000.0
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date) or not re.fullmatch(r'\d{2}:\d{2}', start) or not re.fullmatch(r'\d{2}:\d{2}', end):
+        raise ValueError('日期/时间格式应为 YYYY-MM-DD 和 HH:mm')
+    requested = dt.date.fromisoformat(date)
+    rule = _rule_for(roomobj.get('location', ''))
+    begin_ms, end_ms = _bj_ms(date, start), _bj_ms(date, end)
+    now = _now()
+    if not _date_allowed(roomobj.get('location', ''), requested):
+        raise ValueError('日期不在该位置允许的预约范围内')
+    if begin_ms <= now.timestamp()*1000 or begin_ms < (now + dt.timedelta(hours=rule.get('min_advance_h', 0))).timestamp()*1000:
+        raise ValueError('预约时间已过或不满足最少提前时间')
+    if start < '%02d:00' % rule['start_h'] or end > '%02d:00' % rule['end_h'] or end_ms <= begin_ms:
+        raise ValueError('起止顺序或开放时间不符合规则')
+    if atype not in set(TYPE_MAP.values()) or target != 'school':
+        raise ValueError('活动类型或参与范围无效')
+    if '--force' in sys.argv:
+        raise ValueError('已移除绕过预约检查的 --force')
+    dur_h = (end_ms - begin_ms) / 3600000.0
     if dur_h > 2:
         print(json.dumps({"ok": False, "error": "单次预约时长 %.1fh 超过 2h（规范单次≤2h，审批大概率不通过）" % dur_h}, ensure_ascii=False)); return 1
     body = {
-        "organizer": organizer, "subject": subject, "participantCount": str(participants),
+        "organizer": organizer, "subject": subject, "participantCount": str(pnum),
         "coOrganizer": "", "activityType": atype, "activityTarget": target,
         "needMeal": "--need-meal" in sys.argv, "needFilm": "--need-film" in sys.argv,
         "isBigEvent": "--is-big-event" in sys.argv, "usage": usage,
         "records": [{"type": 0, "roomId": roomobj["id"], "semesterId": semester["id"],
                      "start": _bj_ms(date, start), "end": _bj_ms(date, end)}],
     }
+    # The same preflight is required for preview and submission; errors stop both.
+    mine = _fmt_rows(jwt, ['pending'])
+    for ticket in mine:
+        for rec in ticket['records']:
+            stamp = _epoch_ms(rec.get('start'))
+            if stamp is None:
+                raise ValueError('已有申请的时间无效，不能判断每日限额')
+            if str(_bjd(stamp)) == date:
+                raise ValueError('该日期已有申请，每日最多一次')
+    st_r, rdata = _api('GET', '/activity/rooms/%s/records' % roomobj['id'], jwt)
+    if st_r != 200 or not isinstance(rdata, dict) or not isinstance(rdata.get('value'), list):
+        raise RuntimeError('未能检查时段冲突，已停止预约')
+    for rec in rdata['value']:
+        rs, re_ = _epoch_ms(rec.get('start')), _epoch_ms(rec.get('end'))
+        if rs is None or re_ is None or re_ <= rs:
+            raise ValueError('占用记录无效，已停止预约')
+        if rs < end_ms and re_ > begin_ms:
+            raise ValueError('时段冲突，已停止预约')
     if not yes:
-        print(json.dumps({"ok": True, "dry_run": True, "endpoint": "POST /activity/room-tickets",
-                          "request": body}, ensure_ascii=False))
+        print(json.dumps({'ok':True,'dry_run':True,'request':body}, ensure_ascii=False))
         return 0
-    # 提交前校验：①每日1次 ②该房间该时段是否已被占用/申请中
-    if "--force" not in sys.argv:
-        st_my, mydata = _api("GET", "/activity/room-tickets?state=pending&skip=0&top=50", jwt)
-        if st_my == 200:
-            for t in mydata.get("value", []):
-                for rec in (t.get("records") or []):
-                    s_ms = rec.get("start")
-                    bd = _bjd(s_ms) if isinstance(s_ms, (int, float)) else None
-                    if bd and str(bd) == date:
-                        print(json.dumps({"ok": False, "error": "该日期(%s)已有一笔申请（每日最多 1 次），无法再约" % date}, ensure_ascii=False))
-                        return 1
-        st_r, rdata = _api("GET", "/activity/rooms/%s/records" % roomobj["id"], jwt)
-        recs = rdata.get("value", []) if st_r == 200 else []
-        ts, te = body["records"][0]["start"], body["records"][0]["end"]
-        for rec in recs:
-            rs = _epoch_ms(rec.get("start")); re_ = _epoch_ms(rec.get("end"))
-            if rs is not None and re_ is not None and rs < te and re_ > ts:
-                print(json.dumps({"ok": False, "error": "时段冲突：该房间此时间已被占用/申请中",
-                                  "conflict": {"start": rec.get("start"), "end": rec.get("end"),
-                                               "status": rec.get("status")}}, ensure_ascii=False))
-                return 1
     # 两步：创建 ticket（ticketId 在响应头 Location）-> apply
     st1, _r1, hdrs = _api_full("POST", "/activity/room-tickets", jwt, body=body)
     loc = hdrs.get("Location") or hdrs.get("location") or ""
     ticket_id = loc.rsplit("/", 1)[-1] if loc else None
-    if st1 != 200 or not ticket_id:
-        print(json.dumps({"ok": False, "code": st1, "headers": hdrs, "response": _r1}, ensure_ascii=False)); return 1
+    if st1 not in (200, 201) or not ticket_id:
+        print(json.dumps({"ok": False, "code": st1, "response": _r1}, ensure_ascii=False)); return 1
     st2, resp2 = _api("POST", "/activity/room-tickets/%s/apply" % ticket_id, jwt, body={})
     ok = st2 in (200, 204)
     if not ok:
-        # 提交失败：自动清理刚创建的草稿（避免残留废草稿）
-        _api("POST", "/activity/room-tickets/%s/remove" % ticket_id, jwt, body={})
+        # 不确定结果不得自动删除；保留 ticket_id 供只读核实
+        print(json.dumps({'ok':False,'ticket_id':ticket_id,'result':'提交未确认，请先查询该申请状态再处理；未自动删除'}, ensure_ascii=False))
+        return 1
     print(json.dumps({"ok": ok, "ticket_id": ticket_id, "create_code": st1, "apply_code": st2,
                       "result": "已提交" if ok else resp2}, ensure_ascii=False))
     return 0 if ok else 1
@@ -859,36 +729,42 @@ def cmd_apply(jwt):
 # ---------------- cancel/revoke：撤销申请（并删除撤销后回到草稿箱的草稿，固定步骤） ----------------
 def cmd_cancel(jwt):
     kv = _parse_kv_args(sys.argv[2:])
-    ticket = kv.get("ticket") or kv.get("id")
+    ticket = kv.get('ticket') or kv.get('id')
     if not ticket:
-        print(json.dumps({"ok": False, "error": "缺少 --ticket <ticketId>"}, ensure_ascii=False))
+        raise ValueError('缺少 --ticket')
+    if not _confirmed():
+        print(json.dumps({'ok':True,'dry_run':True,'ticket_id':ticket,'remove_draft':True}, ensure_ascii=False))
+        return 0
+    st, _ = _api('POST', '/activity/room-tickets/%s/revoke' % ticket, jwt, body={'ticketId':ticket})
+    revoked = st in (200, 204)
+    if not revoked:
+        print(json.dumps({'ok':False,'revoked':False,'removed':False,'revoke_code':st,'result':'撤销未确认，未执行删除'}, ensure_ascii=False))
         return 1
-    # 1) 撤销（已提交 → 204；若已是草稿则 412）
-    st, resp = _api("POST", "/activity/room-tickets/%s/revoke" % ticket, jwt, body={"ticketId": ticket})
-    # 2) 固定步骤：删除撤销后回到草稿箱的草稿
-    st2, resp2 = _api("POST", "/activity/room-tickets/%s/remove" % ticket, jwt, body={})
-    ok = (st in (200, 204)) or (st2 in (200, 204))
-    print(json.dumps({"ok": ok, "ticket_id": ticket, "revoke_code": st, "remove_code": st2,
-                      "result": "已撤销并删除草稿" if ok else (resp if not (st in (200, 204)) else resp2)},
-                     ensure_ascii=False))
-    return 0 if ok else 1
+    st2, _ = _api('POST', '/activity/room-tickets/%s/remove' % ticket, jwt, body={})
+    removed = st2 in (200, 204)
+    print(json.dumps({'ok':removed,'ticket_id':ticket,'revoked':True,'removed':removed,
+        'result':'已撤销并删除草稿' if removed else '已撤销，草稿删除未完成'}, ensure_ascii=False))
+    return 0 if removed else 1
 
 
 # ---------------- mine / drafts：我的申请（不含草稿）/ 草稿箱 ----------------
 def _fmt_rows(jwt, states):
     rows = []
-    for s in states:
-        st, data = _api("GET", "/activity/room-tickets?state=%s&skip=0&top=50" % s, jwt)
-        if st != 200:
-            continue
-        for t in (data.get("value", []) if isinstance(data, dict) else []):
-            rows.append({
-                "库": s, "id": t.get("id"), "state": t.get("state"),
-                "target": t.get("activityTarget"), "type": t.get("activityType"),
-                "organizer": (t.get("organizer") or "")[:30], "subject": (t.get("subject") or "")[:30],
-                "created": (t.get("created") or "")[:19].replace("T", " "),
-                "records": (t.get("records") or [])[:3],
-            })
+    for state in states:
+        for skip in range(0, 10000, 50):
+            st, data = _api('GET', '/activity/room-tickets?state=%s&skip=%d&top=50' % (state, skip), jwt)
+            if st != 200 or not isinstance(data, dict) or not isinstance(data.get('value'), list):
+                raise RuntimeError('申请列表查询失败，不能按无记录处理')
+            page = data['value']
+            for t in page:
+                rows.append({'库':state,'id':t.get('id'),'state':t.get('state'),'target':t.get('activityTarget'),
+                    'type':t.get('activityType'),'organizer':(t.get('organizer') or '')[:30],
+                    'subject':(t.get('subject') or '')[:30],'created':str(t.get('created') or '')[:19].replace('T',' '),
+                    'records':t.get('records') or []})
+            if len(page) < 50:
+                break
+        else:
+            raise RuntimeError('申请列表超出查询上限，未取得完整结果')
     return rows
 
 
@@ -936,6 +812,9 @@ def cmd_remove(jwt):
     if not ticket:
         print(json.dumps({"ok": False, "error": "缺少 --ticket <ticketId>"}, ensure_ascii=False))
         return 1
+    if not _confirmed():
+        print(json.dumps({'ok':True,'dry_run':True,'ticket_id':ticket}, ensure_ascii=False))
+        return 0
     st, resp = _api("POST", "/activity/room-tickets/%s/remove" % ticket, jwt, body={})
     ok = st in (200, 204)
     print(json.dumps({"ok": ok, "code": st, "ticket_id": ticket, "result": "已删除" if ok else resp},
@@ -992,10 +871,18 @@ def main():
         return cmd_check()
     if cmd == "jwt":
         return cmd_jwt()
-    # list / occupancy / recommend / avail 需要 jwt
+    if cmd == 'login':
+        return cmd_login(args[1:])
+    if cmd == 'logout':
+        return cmd_logout()
+    if cmd == 'config':
+        return cmd_config(args[1:])
+    if cmd not in ('list','occupancy','recommend','avail','apply','cancel','revoke','mine','drafts','remove','delete'):
+        print(__doc__)
+        return 1
     r = extract_jwt()
     if not r:
-        print(json.dumps({"ok": False, "error": "未获取到可用登录态。请先打开并登录 PC 微信，再打开「学生清华」小程序（可运行 wechat-room-api.py check 查看前置）"}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": "未获取到可用登录态。请先使用 login --card 导入本人学生清华登录态"}, ensure_ascii=False))
         return 2
     jwt, _ = r
     if cmd == "list":
@@ -1022,5 +909,9 @@ def main():
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(json.dumps({'ok':False,'error':str(e)}, ensure_ascii=False))
+        sys.exit(1)

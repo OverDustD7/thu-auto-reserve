@@ -32,7 +32,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const cryptoLib = require('./lib/crypto'); // 会话文件加密（最小改动，防文件被拷走；storage-state/browser-profile 暂不加密）
+const cryptoLib = require('./lib/crypto');
+const sessionLib = require('./lib/session');
+const bj = require('./lib/beijing');
+cryptoLib.installRedaction();
 
 const SITE_URL = 'https://cab.lib.tsinghua.edu.cn/';
 const HOME_HASH = '#/ic/home';
@@ -67,6 +70,8 @@ function parseArgs(argv) {
       flags.add(a.slice(1));
     }
   }
+  if (args.yes !== undefined && args.yes !== true) throw new Error('--yes 必须为独立开关');
+  if (args.yes && args['dry-run']) throw new Error('--yes 与 --dry-run 不能同时使用');
   return { args, flags };
 }
 
@@ -90,75 +95,36 @@ function output(result, json) {
   process.exit(result.code);
 }
 
-function fmtDate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
+function fmtDate(d) { return bj.date(d.getTime()); }
 
 /** 解析用户指定的日期（自然语言/各种格式）→ "YYYY-MM-DD"；无法识别返回空串 */
-function parseDateArg(input) {
-  if (!input) return '';
-  const s = String(input).trim();
-  const today = new Date();
-  const day = (n) => fmtDate(new Date(today.getFullYear(), today.getMonth(), today.getDate() + n));
-
-  // 已含年份：YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
-  let m = s.match(/^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})[日号]?$/);
-  if (m) return `${m[1]}-${String(+m[2]).padStart(2, '0')}-${String(+m[3]).padStart(2, '0')}`;
-  // M月D日 / M-D / M.D / M/D（不带年份，默认今年；若已过去则顺延到明年，避免跨年踩坑）
-  m = s.match(/^(\d{1,2})[-/.月](\d{1,2})[日号]?$/);
-  if (m) {
-    const mm = +m[1] - 1, dd = +m[2];
-    const todayMid = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-    let d = new Date(today.getFullYear(), mm, dd);
-    if (d < todayMid) d = new Date(today.getFullYear() + 1, mm, dd);
-    return fmtDate(d);
-  }
-  // 今天/明天/后天/大后天
-  if (/^(今天|今日|now|today)$/i.test(s)) return day(0);
-  if (/^(明天|明日|tomorrow|tom)$/i.test(s)) return day(1);
-  if (/^(后天|後天)$/i.test(s)) return day(2);
-  if (/^大后天$/.test(s)) return day(3);
-  // 周X（取本周/下一周最近的该天）
-  m = s.match(/^周([一二三四五六日天])$/);
-  if (m) {
-    const wk = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 日: 7, 天: 7 };
-    const target = wk[m[1]];
-    const cur = today.getDay() || 7;
-    let diff = target - cur;
-    if (diff <= 0) diff += 7;
-    return day(diff);
-  }
-  return '';
-}
+function parseDateArg(input) { return bj.parse(input); }
 
 /** 若日期已过去（如填错年份），返回警告串，否则空串 */
-function pastDateWarn(dateArg) {
-  const m = String(dateArg || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return '';
-  const d = new Date(+m[1], +m[2] - 1, +m[3]);
-  const todayMid = new Date();
-  todayMid.setHours(0, 0, 0, 0);
-  return d < todayMid ? `⚠️ ${dateArg} 是过去日期（若年份填错请改正）` : '';
-}
+function pastDateWarn(dateArg) { return dateArg && dateArg < bj.date() ? `⚠️ ${dateArg} 是过去日期` : ''; }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 function readTokenFile() {
-  try {
-    const o = JSON.parse(cryptoLib.decrypt(fs.readFileSync(TOKEN_FILE, 'utf8')));
-    if (o && cryptoLib.isExpired(o.updatedAt)) { try { fs.unlinkSync(TOKEN_FILE); } catch {} return null; }
-    return o;
-  } catch { return null; }
+  sessionLib.removeLegacyProfile(PROFILE_DIR);
+  const token = sessionLib.read(TOKEN_FILE);
+  if (!token) sessionLib.clear([STORAGE_STATE_FILE]);
+  return token;
 }
-function writeTokenFile(obj) {
-  fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
-  fs.writeFileSync(TOKEN_FILE, cryptoLib.encrypt(JSON.stringify(obj, null, 2)));
+
+function writeTokenFile(obj) { sessionLib.write(TOKEN_FILE, obj); }
+async function persistStorageState(context) {
+  const token = readTokenFile();
+  if (!token) throw new Error('登录态未保存');
+  sessionLib.write(STORAGE_STATE_FILE, {...await context.storageState(), updatedAt: token.updatedAt});
 }
+function clearLocalSession() {
+  sessionLib.clear([TOKEN_FILE, STORAGE_STATE_FILE], PROFILE_DIR);
+}
+async function cmdLogout() { clearLocalSession(); console.log('已清除本地登录态'); }
+
 
 /** roomMenu 缓存（房间类型基本不变，缓存 1 小时，省去重复请求） */
 function readRoomMenuCache() {
@@ -186,7 +152,7 @@ async function getRoomMenu(context, token, refresh) {
     writeRoomMenuCache(r.data);
     return r.data;
   }
-  return readRoomMenuCache() || [];
+  throw new Error('空间目录查询失败');
 }
 
 /** 最小化用户信息：只保留学号/账号、姓名；不存 token、手机号/邮箱/卡号/身份证等敏感字段（token 仅在 token.json 顶层单独存，用于会话复用，不出现在输出里） */
@@ -206,11 +172,9 @@ function readCachedToken() {
 }
 
 /** 从 storageState 提取 Cookie 头（供纯 HTTP 请求复用登录会话） */
-function loadCookieHeader() {
-  try {
-    const state = JSON.parse(fs.readFileSync(STORAGE_STATE_FILE, 'utf8'));
-    return (state.cookies || []).map((c) => `${c.name}=${c.value}`).join('; ');
-  } catch { return ''; }
+function loadCookieHeader(target = API_BASE) {
+  if (!readTokenFile()) return '';
+  return sessionLib.cookieHeader(sessionLib.read(STORAGE_STATE_FILE), target);
 }
 
 // ---------------------------------------------------------------------------
@@ -263,10 +227,11 @@ function getApiClient() {
       const qs = new URLSearchParams(params).toString();
       const full = qs ? `${url}${url.includes('?') ? '&' : '?'}${qs}` : url;
       const h = { ...headers };
-      h['Cookie'] = loadCookieHeader();
+      h['Cookie'] = loadCookieHeader(full);
       h['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
       const body = data === undefined || data === null ? undefined : (typeof data === 'string' ? data : JSON.stringify(data));
-      const resp = await globalThis.fetch(full, { method, headers: h, body });
+      const resp = await globalThis.fetch(full, { method, headers: h, body, redirect: 'error', signal: AbortSignal.timeout(20000) });
+      if (!resp.ok) throw new Error('HTTP 请求失败：' + resp.status);
       const text = await resp.text();
       return { text: async () => text };
     },
@@ -351,10 +316,23 @@ async function acquireProfileLock(timeoutMs = 180000) {
   }
 }
 
+async function launchSession(chromium, options) {
+  readTokenFile();
+  const context = await sessionLib.launch(chromium, options, STORAGE_STATE_FILE, PROFILE_DIR);
+  const tk = readTokenFile();
+  if (tk) await context.addInitScript(u => {
+    if (location.origin === 'https://cab.lib.tsinghua.edu.cn') {
+      sessionStorage.setItem('userInfo', JSON.stringify(u));
+      sessionStorage.setItem('isLogin', 'true');
+    }
+  }, {...tk.userInfo, token: tk.token});
+  return context;
+}
+
 async function launchContext(headless) {
   await acquireProfileLock();
   const { chromium } = playwright();
-  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  sessionLib.removeLegacyProfile(PROFILE_DIR);
   const base = {
     headless: !!headless,
     viewport: { width: 1280, height: 800 },
@@ -364,14 +342,14 @@ async function launchContext(headless) {
   let lastErr = null;
   for (const channel of channels) {
     try {
-      return await chromium.launchPersistentContext(PROFILE_DIR, { ...base, channel });
+      return await launchSession(chromium, { ...base, channel });
     } catch (e) { lastErr = e; }
   }
   try {
-    return await chromium.launchPersistentContext(PROFILE_DIR, base);
+    return await launchSession(chromium, base);
   } catch (e) {
     if (/EPERM|permission|not permitted/i.test(String((e && e.message) || (lastErr && lastErr.message) || ''))) {
-      console.error('[错误] 启动浏览器被沙箱拦截（spawn EPERM）：系统 Chrome/Edge 存在但无法启动。请下次运行前先以更宽权限（danger-full-access）提权再运行；不要安装 Chromium。');
+      console.error('[错误] 启动浏览器被沙箱拦截（spawn EPERM）：系统 Chrome/Edge 存在但无法启动。请通过当前宿主申请启动浏览器所需的最小权限后重试；不要安装 Chromium。');
       throw lastErr || e;
     }
     console.error('[错误] 未能启动浏览器。请确认已安装 Google Chrome 或 Microsoft Edge，');
@@ -426,11 +404,11 @@ async function ensureToken(context, { waitMs = 5000 } = {}) {
 /** 依次检查 Chrome / Edge 是否已有登录会话，命中则保存并返回 { token, channel } */
 async function checkExistingLogin() {
   const { chromium } = playwright();
-  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  sessionLib.removeLegacyProfile(PROFILE_DIR);
   for (const channel of ['chrome', 'msedge']) {
     let context = null;
     try {
-      context = await chromium.launchPersistentContext(PROFILE_DIR, { headless: true, channel });
+      context = await launchSession(chromium, { headless: true, channel });
       const page = await context.newPage();
       await page.goto(SITE_URL + HOME_HASH, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       // 等 sessionStorage.userInfo 出现（最多 4s），命中立即返回，不再固定等 3.5s
@@ -444,7 +422,7 @@ async function checkExistingLogin() {
           try { return JSON.parse(sessionStorage.getItem('userInfo') || 'null'); } catch { return null; }
         });
         writeTokenFile({ token, userInfo: minimalUserInfo(info), updatedAt: new Date().toISOString() });
-        try { fs.writeFileSync(STORAGE_STATE_FILE, JSON.stringify(await context.storageState(), null, 2)); } catch {}
+        await persistStorageState(context);
         return { token, channel };
       }
     } catch { /* 该浏览器不可用或无会话 */ }
@@ -471,7 +449,7 @@ function ensurePackageJson() {
   try { pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')); } catch { pkg = {}; }
   if (typeof pkg !== 'object' || Array.isArray(pkg)) pkg = {};
   if (!pkg.name) pkg.name = 'thu-lib-space-reserve';
-  if (!pkg.version) pkg.version = '1.1.0';
+  if (!pkg.version) pkg.version = '1.2.0';
   pkg.private = true;
   const prev = (pkg.allowScripts && typeof pkg.allowScripts === 'object' && !Array.isArray(pkg.allowScripts)) ? pkg.allowScripts : {};
   pkg.allowScripts = { ...prev, playwright: true };
@@ -525,14 +503,6 @@ async function cmdSetup(argv) {
 // 登录
 // ---------------------------------------------------------------------------
 /** 清除本地软会话（token/cookie/缓存/锁），不删除浏览器 profile（避免启动失败时丢失会话） */
-function clearLocalSession() {
-  try { fs.unlinkSync(TOKEN_FILE); } catch {}
-  try { fs.unlinkSync(STORAGE_STATE_FILE); } catch {}
-  try { fs.unlinkSync(ROOM_MENU_CACHE_FILE); } catch {}
-  try { fs.unlinkSync(PROFILE_DIR + '.lock'); } catch {}
-  // 不删 PROFILE_DIR：浏览器 profile 会话保留，改为登录成功后在浏览器内清 session（见 cmdLogin）
-}
-
 async function cmdLogin(argv) {
   const { args } = parseArgs(argv);
   const json = !!args.json;
@@ -606,7 +576,7 @@ async function cmdLogin(argv) {
     try { return JSON.parse(sessionStorage.getItem('userInfo') || 'null'); } catch { return null; }
   });
   writeTokenFile({ token, userInfo: minimalUserInfo(info), updatedAt: new Date().toISOString() });
-  try { fs.writeFileSync(STORAGE_STATE_FILE, JSON.stringify(await context.storageState(), null, 2)); } catch {}
+  await persistStorageState(context);
   if (!json) {
     console.log('✅ 登录成功，会话已保存到 ' + PROFILE_DIR);
     console.log('   token 已缓存到 ' + TOKEN_FILE);
@@ -757,14 +727,16 @@ function findItem(arr, arg) {
   const byId = (x) => x.uuid === a || x.kindId === a || String(x.kindId) === a || String(x.id) === a || String(x.sysValue) === a;
   const byExact = (x) => names(x).some((n) => n != null && normName(n) === na);
   const byPartial = (x) => names(x).some((n) => { const nn = normName(n); return nn && (nn.includes(na) || na.includes(nn)); });
-  return arr.find(byId) || arr.find(byExact) || arr.find(byPartial) || null;
+  for (const match of [byId, byExact, byPartial]) {
+    const hits = arr.filter(match);
+    if (hits.length > 1) throw new Error('匹配到多个资源，请指定完整名称或编号');
+    if (hits.length === 1) return hits[0];
+  }
+  return null;
 }
 
 /** "HH:mm" / "HH:mm:ss" → 当天分钟数 */
-function toMin(hm) {
-  const parts = String(hm || '').split(':').map(Number);
-  return (parts[0] || 0) * 60 + (parts[1] || 0);
-}
+function toMin(hm) { return bj.toMin(hm); }
 
 /** 当天分钟数 → "HH:mm" */
 function toHM(min) {
@@ -772,46 +744,20 @@ function toHM(min) {
 }
 
 /** 把 /reserve 返回的单个房间解析为 空闲/已约 结构 */
-function parseSlotRoom(room, kindName, kindId, nowMin, isToday, minUnit) {
-  const devName = String(room.devName || '');
-  const open = (Array.isArray(room.openTimes) && room.openTimes[0]) || null;
-  const s = open ? toMin(open.openStartTime) : toMin(room.openStart || '08:00');
-  const e = open ? toMin(open.openEndTime) : toMin(room.openEnd || '22:00');
-
-  // 已约区间：resvInfo[].startTime/endTime 为毫秒时间戳 → 本地 HH:mm 分钟
-  const blocks = (Array.isArray(room.resvInfo) ? room.resvInfo : [])
-    .map((b) => {
-      const st = new Date(b.startTime), en = new Date(b.endTime);
-      if (isNaN(st.getTime()) || isNaN(en.getTime())) return null;
-      return [st.getHours() * 60 + st.getMinutes(), en.getHours() * 60 + en.getMinutes()];
-    })
-    .filter(Boolean)
-    .sort((a, b) => a[0] - b[0]);
-
-  // 合并重叠区间
-  const merged = [];
-  for (const b of blocks) {
-    if (merged.length && b[0] <= merged[merged.length - 1][1]) merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], b[1]);
-    else merged.push([...b]);
-  }
-
-  // 空闲 = 开放窗口 − 已约区间；查今天只保留未来（>= now）
-  const avail = [];
-  let cursor = isToday ? Math.max(s, nowMin) : s;
-  for (const b of merged) {
-    if (cursor < b[0] && b[0] - cursor >= minUnit) avail.push([cursor, b[0]]);
-    cursor = Math.max(cursor, b[1]);
-  }
-  if (cursor < e && e - cursor >= minUnit) avail.push([cursor, e]);
-
-  return {
-    kindName, kindId, devName,
-    devId: room.devId || '',
-    minUser: room.minUser, maxUser: room.maxUser,
-    openStart: toHM(s), openEnd: toHM(e),
-    booked: blocks.map((b) => `${toHM(b[0])}–${toHM(b[1])}`),
-    available: avail.map((a) => `${toHM(a[0])}–${toHM(a[1])}`),
-  };
+function parseSlotRoom(room, kindName, kindId, nowMin, isToday, minUnit, dateArg = bj.date()) {
+  const open = bj.windows(room);
+  const midnight = new Date(dateArg + 'T00:00:00+08:00').getTime();
+  const blocks = (room.resvInfo || []).map(b => {
+    const start = new Date(b.startTime).getTime(), end = new Date(b.endTime).getTime();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error('占用时间无效，无法计算空闲');
+    return [(start-midnight)/60000, (end-midnight)/60000];
+  });
+  const available = bj.free(open, blocks, minUnit, isToday ? nowMin : 0);
+  return {kindName,kindId,devName:String(room.devName || ''),devId:room.devId || '',minUser:room.minUser,maxUser:room.maxUser,
+    openStart:open.length ? toHM(open[0][0]) : '',openEnd:open.length ? toHM(open.at(-1)[1]) : '',
+    openWindows:open.map(([a,b])=>`${toHM(a)}–${toHM(b)}`),
+    booked:bj.merge(blocks.map(([a,b])=>[Math.max(0,a),Math.min(1440,b)])).map(([a,b])=>`${toHM(a)}–${toHM(b)}`),
+    available:available.map(([a,b])=>`${toHM(a)}–${toHM(b)}`)};
 }
 
 /**
@@ -852,7 +798,7 @@ async function cmdSlots(argv) {
   // 权威时间网格：GET /reserve?kindIds=&resvDates=&sysKind=（resvInfo 为毫秒时间戳占用）
   const now = new Date();
   const isToday = dateArg === fmtDate(now);
-  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const nowMin = bj.minute(now.getTime()) + 1;
 
   // 并行查询各类型，减少串行等待
   const results = await Promise.all(kinds.map(async (k) => {
@@ -864,8 +810,8 @@ async function cmdSlots(argv) {
   const rooms = [];
   for (const { k, r } of results) {
     if (isAuthError(r)) return output({ code: EXIT_UNAUTH, message: '登录过期，请重新运行 login' }, json);
-    if (!isOk(r)) continue;
-    for (const room of toArray(r.data)) rooms.push(parseSlotRoom(room, k.kindName, k.kindId, nowMin, isToday, minUnit));
+    if (!isOk(r)) throw new Error('空间查询失败，不能按无可约房间处理');
+    for (const room of toArray(r.data)) rooms.push(parseSlotRoom(room, k.kindName, k.kindId, nowMin, isToday, minUnit, dateArg));
   }
 
   const warn = pastDateWarn(dateArg);
@@ -931,9 +877,9 @@ function roomLabelOf(x) {
 /** 时间戳（毫秒）→ "YYYY-MM-DD HH:mm" */
 function fmtTs(ts) {
   if (!ts) return '';
-  const d = new Date(Number(ts));
-  if (isNaN(d.getTime())) return String(ts);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const millis = typeof ts === 'number' || /^\d+$/.test(String(ts)) ? Number(ts) : Date.parse(ts);
+  if (!Number.isFinite(millis)) return String(ts);
+  return `${bj.date(millis)} ${toHM(bj.minute(millis))}`;
 }
 
 async function cmdOrders(argv) {
@@ -978,7 +924,9 @@ async function cmdCancel(argv) {
   const { args } = parseArgs(argv);
   const json = !!args.json;
   const uuidArg = args.uuid || args.resv || args.id || '';
-  const yes = !!args.yes;
+  if (args.yes && args.yes !== true) throw new Error('--yes 必须为独立开关');
+  if (args.yes && args['dry-run']) throw new Error('--yes 与 --dry-run 不能同时使用');
+  const yes = args.yes === true;
   const token = readCachedToken();
   if (!token) return output({ code: EXIT_UNAUTH, message: '未登录，请先运行 login' }, json);
   if (!uuidArg) {
@@ -1089,8 +1037,8 @@ async function cmdOpen(argv) {
 /** 注入登录态（Cookie + sessionStorage.userInfo），确保预约页已登录 */
 async function injectLoginState(context, page) {
   try {
-    const state = JSON.parse(fs.readFileSync(STORAGE_STATE_FILE, 'utf8'));
-    const cookies = (state.cookies || []).map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path || '/' }));
+    const state = sessionLib.read(STORAGE_STATE_FILE) || {};
+    const cookies = (state.cookies || []).map((c) => ({ ...c, path: c.path || '/' }));
     if (cookies.length) await context.addCookies(cookies);
   } catch { /* 无 storageState 则跳过 */ }
   // 注入「完整」userInfo（含 email/handPhone 等）：实时从 auth/userInfo 拉取、只进浏览器内存、不落盘。
@@ -1106,7 +1054,9 @@ async function injectLoginState(context, page) {
         if (isOk(me) && me.data) ui = me.data;
       } catch { /* API 拉取失败则退回本地 minimal（可能触发邮箱误判，但不崩溃） */ }
       if (ui) {
+        ui = {...ui, token: tk.token};
         await page.addInitScript((u) => {
+          if (location.origin !== 'https://cab.lib.tsinghua.edu.cn') return;
           try { sessionStorage.setItem('userInfo', JSON.stringify(u)); sessionStorage.setItem('isLogin', 'true'); } catch {}
         }, ui);
       }
@@ -1165,7 +1115,20 @@ async function clickMenuByName(page, kindName) {
   }, kindName);
 }
 
-/** 用日期选择器（el-date-editor--date）跳转到任意日期 */
+async function waitForSelectedDate(page, dateArg) {
+  try {
+    await page.waitForFunction((tabId) => {
+      const el = document.getElementById(tabId);
+      return !!el && el.getAttribute('aria-disabled') !== 'true'
+        && !el.classList.contains('is-disabled')
+        && (el.getAttribute('aria-selected') === 'true' || el.classList.contains('is-active'));
+    }, 'tab-' + String(dateArg).replace(/-/g, '/'), { timeout: 5000 });
+    await page.waitForTimeout(1500);
+    return true;
+  } catch { return false; }
+}
+
+/** 用日期选择器跳转，并核实页面实际选中的日期。 */
 async function selectDateByPicker(page, dateArg) {
   try {
     const input = page.locator('.el-date-editor--date input.el-input__inner').first();
@@ -1174,8 +1137,7 @@ async function selectDateByPicker(page, dateArg) {
     await input.fill(String(dateArg));
     await page.waitForTimeout(200);
     await input.press('Enter');
-    await page.waitForTimeout(1200);
-    return true;
+    return await waitForSelectedDate(page, dateArg);
   } catch { return false; }
 }
 
@@ -1184,13 +1146,12 @@ async function selectDateTab(page, dateArg) {
   const id = 'tab-' + String(dateArg).replace(/-/g, '/');
   const tryFind = () => page.evaluate((tabId) => {
     const el = document.getElementById(tabId);
-    if (el) { el.click(); return true; }
+    if (el && el.getAttribute('aria-disabled') !== 'true' && !el.classList.contains('is-disabled')) { el.click(); return true; }
     return false;
   }, id);
 
   if (await tryFind()) {
-    await page.waitForTimeout(1500); // 等日期网格刷新，避免在旧日期网格上点击
-    return true;
+    return waitForSelectedDate(page, dateArg);
   }
 
   // 日期选择器（可跳转到任意日期，如 9月12日）
@@ -1207,7 +1168,7 @@ async function selectDateTab(page, dateArg) {
   });
   if (!clicked) return false;
   await page.waitForTimeout(1500);
-  return tryFind();
+  return (await tryFind()) && await waitForSelectedDate(page, dateArg);
 }
 
 /** 点击指定房间（devName，如「北馆3F-01」）的时间网格，打开「申请预约」弹窗 */
@@ -1298,9 +1259,6 @@ async function selectDialogTime(page, startHM, endHM) {
       await sels.nth(2).click();
       await page.waitForTimeout(500);
       if (!(await pickOpt(endHM))) {
-        const opts = await page.locator('.el-select-dropdown:visible .el-select-dropdown__item').allTextContents();
-        if (!opts.length) return false;
-        await page.locator('.el-select-dropdown:visible .el-select-dropdown__item').first().click();
         return false; // 标记：结束时间未被精确设为 endHM
       }
       await page.waitForTimeout(400);
@@ -1328,9 +1286,11 @@ async function fillMembers(page, members) {
       await page.waitForTimeout(300);
       await input.fill(sid);
       await page.waitForTimeout(1200); // 等远程搜索结果
-      const opt = page.locator('.el-select-dropdown:visible .el-select-dropdown__item').first();
-      if (!(await opt.count())) return false; // 无匹配结果
-      await opt.click();
+      const options = page.locator('.el-select-dropdown:visible .el-select-dropdown__item');
+      const texts = await options.allTextContents();
+      const exact = texts.map((t,i) => ({i,ids:t.match(/[0-9A-Za-z]+/g) || []})).filter(x => x.ids.includes(sid));
+      if (exact.length !== 1) return false;
+      await options.nth(exact[0].i).click();
       await page.waitForTimeout(400);
     }
     return true;
@@ -1355,6 +1315,12 @@ async function cmdReserveBrowser(argv) {
   const members = (args.members || args.member || '').split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean); // 成员学号列表
 
   if (!roomArg) return output({ code: EXIT_FAIL, message: '缺少 --room 参数（房间类型名，如「北馆单人研读间」）' }, json);
+  if (dateArg && dateArg < bj.date()) throw new Error('预约日期不能是过去');
+  if (timeArg) toMin(timeArg);
+  if (endArg) toMin(endArg);
+  if (endArg && !timeArg) throw new Error('指定 --end 时必须同时指定 --time');
+  if (timeArg && endArg && toMin(endArg) <= toMin(timeArg)) throw new Error('结束时间必须晚于开始时间');
+  if (dateArg === bj.date() && timeArg && toMin(timeArg) <= bj.minute()) throw new Error('开始时间已经过去');
   if (!json) {
     const dw = pastDateWarn(dateArg);
     console.log(dw ? `⚠️ 解析日期：${dateArg}（过去日期，请核对年份）` : `📅 解析日期：${dateArg || '（未指定，使用页面默认日期）'}`);
@@ -1400,12 +1366,14 @@ async function cmdReserveBrowser(argv) {
   // 4) 选择日期
   if (dateArg) {
     const ok = await selectDateTab(page, dateArg);
-    if (!json) console.log(ok ? `✅ 已选择日期 ${dateArg}` : `⚠️ 未找到日期 ${dateArg}（可能已过期/未开放），使用默认日期`);
+    if (!ok) { await browser.close(); throw new Error('未能选中指定日期，已停止后续操作'); }
+    if (!json) console.log(`✅ 已选择日期 ${dateArg}`);
   }
 
   // 5) 点击房间时间网格 → 打开「申请预约」弹窗
   if (devArg) {
     const ok = await clickRoomGrid(page, devArg, timeArg);
+    if (!ok) { await browser.close(); throw new Error('未能选中指定房间，已停止'); }
     if (!json) console.log(ok ? `✅ 已点击房间 ${devArg}，正在打开「申请预约」弹窗…` : `⚠️ 未找到房间 ${devArg}，请手动点击其时间网格`);
     // 等弹窗出现（不再固定等 3s）
     await page.waitForSelector('.el-dialog[aria-label="申请预约"]', { state: 'visible', timeout: 8000 }).catch(() => {});
@@ -1415,12 +1383,14 @@ async function cmdReserveBrowser(argv) {
   if (timeArg) {
     const end = endArg || plusMinutes(timeArg, 60);
     const ok = await selectDialogTime(page, timeArg, end);
+    if (!ok) { await browser.close(); throw new Error('未能选中指定时间，已停止'); }
     if (!json) console.log(ok ? `✅ 已在弹窗内选择时间 ${timeArg} ~ ${end}` : `⚠️ 未能在弹窗内自动选择时间，请手动选择（${timeArg} ~ ${end}）`);
   }
 
   // 7) 在弹窗内自动填写组成员学号
   if (members.length) {
     const ok = await fillMembers(page, members);
+    if (!ok && !json) console.log('成员无法自动精确核实，请在当前页面手动选择并逐一核对后提交。');
     if (!json) console.log(ok ? `✅ 已填写组成员：${members.join('、')}` : `⚠️ 未能自动填写部分成员，请手动在「组成员」里搜索添加：${members.join('、')}`);
   }
 
@@ -1455,10 +1425,13 @@ async function cmdReserve(argv) {
   const timeArg = String(args.time || '').trim();
   const endArg = String(args.end || '').trim();
   const members = (args.members || args.member || '').split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean);
-  const yes = !!args.yes;
+  if (args.yes && args.yes !== true) throw new Error('--yes 必须为独立开关');
+  if (args.yes && args['dry-run']) throw new Error('--yes 与 --dry-run 不能同时使用');
+  const yes = args.yes === true;
   if (args.browser) return cmdReserveBrowser(argv);   // 显式 --browser：回退浏览器 UI
 
   if (!roomArg) return output({ code: EXIT_FAIL, message: '缺少 --room' }, json);
+  if (!devArg) throw new Error('预约必须指定确切房间 --dev');
   if (!dateArg) return output({ code: EXIT_FAIL, message: '缺少 --date' }, json);
   if (!timeArg || !endArg) return output({ code: EXIT_FAIL, message: '缺少 --time/--end' }, json);
   const token = readCachedToken();
@@ -1474,33 +1447,31 @@ async function cmdReserve(argv) {
   // ② 房间 → devId/minUser/maxUser/openTimes
   const av = await apiCall(ctx, token, 'GET', 'reserve', { kindIds: kindId, resvDates: dateArg.replace(/-/g, ''), sysKind: kindClass });
   const rooms = toArray(av.data);
-  if (!isOk(av) || !rooms.length) { await ctx.close(); return output({ code: EXIT_FAIL, message: '该日期该类型无可约房间' }, json); }
-  // 房间匹配：先精确（normName 全等），再子串（双向包含）——兼容只传短名（如「法F5-研讨舱1」匹配「法F5-研讨舱1（4人间）」）
-  let room = devArg ? rooms.find((r) => normName(r.devName) === normName(devArg)) : rooms[0];
-  if (!room && devArg) {
-    const d = normName(devArg);
-    room = rooms.find((r) => { const n = normName(r.devName); return n && d && (n.includes(d) || d.includes(n)); });
-  }
-  if (!room) { await ctx.close(); return output({ code: EXIT_FAIL, message: '未找到房间：' + devArg }, json); }
+  if (!isOk(av)) throw new Error('房间可约状态查询失败');
+  if (!rooms.length) { await ctx.close(); return output({ code: EXIT_FAIL, message: '该日期该类型无可约房间' }, json); }
+  const matches = rooms.filter(r => String(r.devId) === String(devArg) || normName(r.devName) === normName(devArg));
+  if (matches.length !== 1) throw new Error('房间名称不唯一或未精确匹配，请使用查询结果中的完整房间名/编号');
+  const room = matches[0];
   const devId = room.devId;
   const minUser = Number(room.minUser) || 1, maxUser = Number(room.maxUser) || 1;
 
   // ③ 规则校验
   const rule = typeRule(kindName);
-  const open = (Array.isArray(room.openTimes) && room.openTimes[0]) || null;
-  const os = open ? toMin(open.openStartTime) : toMin(room.openStart || '08:00');
-  const oe = open ? toMin(open.openEndTime) : toMin(room.openEnd || '22:00');
-  const startMin = toMin(timeArg), endMin = toMin(endArg), durMin = endMin - startMin;
-  const today0 = new Date(); today0.setHours(0, 0, 0, 0);
-  const reqDate = new Date(dateArg + 'T00:00:00');
-  const maxDate = new Date(today0.getTime() + (rule.advance - 1) * 86400000);
+  const openWindows = bj.windows(room);
+  const startMin = toMin(timeArg), endMin = toMin(endArg), durMin = endMin-startMin;
+  const today = bj.date(), maxDate = bj.addDays(today, rule.advance-1);
   const errs = [];
-  if (reqDate < today0) errs.push('预约日期不能是过去');
-  if (reqDate > maxDate) errs.push(`超出提前预约范围（最晚 ${fmtDate(maxDate)}）`);
-  if (startMin < os || endMin > oe) errs.push(`时段超出开放时间 ${toHM(os)}–${toHM(oe)}`);
-  if (durMin < 30) errs.push('时长不足 30 分钟');
-  if (durMin > rule.maxDur) errs.push(`时长超过上限 ${rule.maxDur} 分钟`);
-  if (errs.length) { await ctx.close(); return output({ code: EXIT_FAIL, message: '预约请求违反规则：' + errs.join('；') }, json); }
+  if (dateArg < today) errs.push('预约日期不能是过去');
+  if (dateArg > maxDate) errs.push(`超出提前预约范围（最晚 ${maxDate}）`);
+  if (dateArg === today && new Date(`${dateArg}T${timeArg}:00+08:00`).getTime() <= Date.now()) errs.push('开始时间已经过去');
+  if (!openWindows.some(([a,b]) => startMin >= a && endMin <= b)) errs.push('时段超出开放窗口');
+  if (durMin < 30 || durMin > rule.maxDur) errs.push(`时长必须为30–${rule.maxDur}分钟`);
+  for (const booked of room.resvInfo || []) {
+    const bs = new Date(booked.startTime).getTime(), be = new Date(booked.endTime).getTime();
+    if (!Number.isFinite(bs) || !Number.isFinite(be) || be <= bs) throw new Error('占用记录时间无效');
+    if (bs < new Date(`${dateArg}T${endArg}:00+08:00`).getTime() && be > new Date(`${dateArg}T${timeArg}:00+08:00`).getTime()) errs.push('时段已被占用');
+  }
+  if (errs.length) { await ctx.close(); return output({code:EXIT_FAIL,message:errs.join('；')},json); }
 
   // ④ 本人证号
   const tk = readTokenFile();
@@ -1511,19 +1482,18 @@ async function cmdReserve(argv) {
   }
   if (!selfAccNo) { await ctx.close(); return output({ code: EXIT_FAIL, message: '无法获取本人 accNo' }, json); }
 
-  // ⑤ 成员学号 → 证号（logonName 被脱敏，取首个结果 + 后两位弱校验）
+  // --members takes full student ids. Masked/ambiguous matches are never guessed.
+  // A user-verified internal account number can instead be supplied with --member-accnos.
+  const verifiedAccNos = new Set(String(args['member-accnos'] || '').split(/[,，、\s]+/).filter(Boolean));
   const resvMember = [String(selfAccNo)];
-  for (const id of members) {
-    const r = await apiCall(ctx, token, 'GET', 'account/getMembers', { key: id, page: 1, pageNum: 10 });
+  for (const id of new Set([...members, ...verifiedAccNos])) {
+    const r = await apiCall(ctx,token,'GET','account/getMembers',{key:id,page:1,pageNum:10});
+    if (!isOk(r)) throw new Error('成员查询失败，已停止预约');
     const list = toArray(r.data);
-    const hit = list.find((x) => String(x.accNo) === String(id)) || list[0];
-    if (!hit) { await ctx.close(); return output({ code: EXIT_FAIL, message: '未找到成员：' + id }, json); }
-    if (String(hit.accNo) === String(selfAccNo)) continue;   // 本人已自动计入，跳过用户误填的本人学号（去重）
-    const tail = String(id).slice(-2);
-    if (tail && String(hit.logonName || '').indexOf(tail) < 0) {
-      await ctx.close(); return output({ code: EXIT_FAIL, message: '成员 ' + id + ' 匹配不确定：' + hit.logonName }, json);
-    }
-    resvMember.push(String(hit.accNo));
+    const hits = list.filter(x => verifiedAccNos.has(id) ? String(x.accNo) === id : [x.logonName,x.card,x.studentId].some(v => v != null && String(v) === id));
+    if (hits.length !== 1 || !hits[0].accNo) throw new Error('成员身份无法精确核实，请在页面核对成员或使用已核实的证号');
+    const acc = String(hits[0].accNo);
+    if (!resvMember.includes(acc)) resvMember.push(acc);
   }
   // 去重后再校验人数（本人计 1；去重后 resvMember.length 为实际人数）
   if (resvMember.length < minUser || resvMember.length > maxUser) {
@@ -1549,6 +1519,7 @@ async function cmdReserve(argv) {
 // 入口
 // ---------------------------------------------------------------------------
 const commands = {
+  logout: cmdLogout,
   setup: cmdSetup,
   login: cmdLogin,
   'bind-email': cmdBindEmail,

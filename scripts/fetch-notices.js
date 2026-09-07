@@ -8,17 +8,19 @@ const STORAGE = path.join(HOME, '.thu-lib-space', 'storage-state.json');
 const API_BASE = 'https://cab.lib.tsinghua.edu.cn/ic-web';
 const OUT = path.join(__dirname, '..', 'references', 'lib-space-notices.md');
 
-const token = JSON.parse(cryptoLib.decrypt(fs.readFileSync(TOKEN_FILE, 'utf8'))).token;
-let cookie = '';
-try { const s = JSON.parse(fs.readFileSync(STORAGE, 'utf8')); cookie = (s.cookies || []).map((c) => `${c.name}=${c.value}`).join('; '); } catch {}
+const sessionLib = require('./lib/session');
+cryptoLib.installRedaction();
+let token;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function call(pathname, params) {
   const qs = new URLSearchParams(params).toString();
   const r = await fetch(`${API_BASE}/${pathname}${qs ? '?' + qs : ''}`, {
-    headers: { token, lan: '1', Cookie: cookie, 'User-Agent': 'Mozilla/5.0' },
+    headers: { token, lan: '1', Cookie: sessionLib.cookieHeader(sessionLib.read(STORAGE), `${API_BASE}/${pathname}`), 'User-Agent': 'Mozilla/5.0' },
+    redirect: 'error', signal: AbortSignal.timeout(20000),
   });
+  if (!r.ok) throw new Error('须知请求失败：' + r.status);
   return r.json();
 }
 
@@ -36,13 +38,18 @@ function htmlToText(html) {
 }
 
 (async () => {
+  sessionLib.removeLegacyProfile(path.join(HOME, '.thu-lib-space', 'browser-profile'));
+  const saved = sessionLib.read(TOKEN_FILE);
+  if (!saved?.token) { sessionLib.clear([STORAGE]); throw new Error('未登录，请先登录图书馆空间'); }
+  token = saved.token;
   const menu = await call('roomMenu', {});
-  if (menu.code !== 0) { console.log('roomMenu 失败', JSON.stringify(menu)); return; }
+  if (menu.code !== 0 || !Array.isArray(menu.data)) throw new Error('空间目录查询失败，未更新须知文件');
   const kinds = menu.data;
 
   const results = [];
   for (const kind of kinds) {
     const r = await call('sysInfo', { sysType: 1, sysValue: String(kind.kindId), sysKind: 2, status: 2 });
+    if (r.code !== 0) throw new Error('须知查询失败，未覆盖原文件');
     const content = (r.code === 0 && r.data && r.data.content) ? htmlToText(unescapeContent(r.data.content)) : '（无须知）';
     results.push({ kindId: kind.kindId, kindName: kind.kindName, kindClass: kind.kindClass, content });
     console.log(`✅ ${kind.kindName}（kindId=${kind.kindId}）`);
@@ -68,4 +75,4 @@ function htmlToText(html) {
   }
   fs.writeFileSync(OUT, lines.join('\n'));
   console.log('\n已写入 ' + OUT + '，共 ' + results.length + ' 条');
-})();
+})().catch(e => { console.error(cryptoLib.scrub(e.message)); process.exitCode = 1; });

@@ -390,7 +390,8 @@ def cmd_apply(args):
         "step": "已到达活动室申请表单（第①步 基本信息）",
         "handoff": "请用户填写：【主办方】【活动主题】【参与人数】【活动类型】【活动内容】，再点「选择时间」选日期/起止，最后提交。",
         "query_hint": "可先 wechat-room-api.py list 查房间，recommend 推荐，avail 查可约时段，occupancy <房间> 查占用。",
-        "submitted": bool(yes),
+        "submitted": False,
+        "next_step_opened": bool(yes),
     }, ensure_ascii=False))
     return 0
 

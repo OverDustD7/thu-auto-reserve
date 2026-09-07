@@ -22,7 +22,7 @@
  *
  * 预约/取消（真实动作，默认只预演，须显式 --yes 才真正提交；系统仅每日 6:00–23:00 开放，时段外会被拒绝）：
  *   reserve --seat <座位id> --segment <时段id> [--yes]     调试兜底，正常流程不调用
- *   cancel  [--id <预约id>] [--yes]    取消；不指定 --id 时自动取消第一条
+ *   cancel  [--id <预约id>] [--yes]    取消；必须明确指定 --id
  *
  * 退出码：0=成功  1=失败  2=未登录/登录过期
  * 数据命令支持 --json，输出单行机器可读 JSON。
@@ -32,7 +32,10 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const cryptoLib = require('./lib/crypto'); // 会话文件加密（最小改动，防文件被拷走；storage-state/browser-profile 暂不加密）
+const cryptoLib = require('./lib/crypto');
+const sessionLib = require('./lib/session');
+const bj = require('./lib/beijing');
+cryptoLib.installRedaction();
 
 const BASE = 'https://seat.lib.tsinghua.edu.cn';
 const HOME_DIR = path.join(os.homedir(), '.thu-lib-seat');
@@ -64,7 +67,7 @@ const LIB_INTRO = {
   64: '总馆西馆（逸夫馆）：理工/科技/医药/建筑/计算机专业图书主藏，另有现刊报纸阅览区',
   89: '人文社科图书馆（文图）：一层信息空间（50 余台电脑、扩展屏、文印扫描）；另设研读间/研讨间 50 间（走 IC 空间系统）',
   6: '胡宝星法律图书馆（法学院内）：法律文献；中文/西文/日文图书分区，静音舱、单人研读间、坡道阅览区',
-  19: '美术图书馆：2026-08-04 起因施工改造闭馆暂停开放（故无座位）',
+  19: '美术图书馆：历史通知记录 2026-08-04 起施工闭馆；当前开放以实时系统为准',
   29: '金融图书馆（五道口金融学院内）：1200㎡、约 100 坐席、11 万藏书；开架区 + 地下书库，经济金融类为主',
 };
 
@@ -87,8 +90,8 @@ const FLOOR_FACILITIES = {
   8: '中文图书区 A-D913、计算法学/教学参考书专架、坡道阅览座、休闲区、静音舱',
   9: '中文图书区 D924-G、西文图书区、单人研读间、坡道阅览座、静音舱',
   10: '日文图书区、法学学位论文、《明清档案》、静音舱',
-  20: 'C/E/N/S/W 阅览区（闭馆暂停开放）',
-  21: 'C/E 阅览区（闭馆暂停开放）',
+  20: 'C/E/N/S/W 阅览区（开放状态以实时系统为准）',
+  21: 'C/E 阅览区（开放状态以实时系统为准）',
   30: '开架借阅区：图书(经济金融)、五道口硕博论文、期刊报纸、国际金融机构资料(IMF/ADB/WB)、校友专架、自助借书、检索机（书架间自习座）',
 };
 
@@ -112,7 +115,7 @@ function isReservationOpen() {
 
 // 预约范围仅「当日/次日」；判断某日期（YYYY-MM-DD）是否可约
 function isReservableDate(date) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return false;
+  if (!bj.validDate(date)) return false;
   const [y, m, d] = date.split('-').map(Number);
   const target = Date.UTC(y, m - 1, d);
   const bj = new Date(Date.now() + 8 * 3600 * 1000);
@@ -126,68 +129,37 @@ function ensureDir(dir) {
 }
 
 function loadSession() {
-  try {
-    const s = JSON.parse(cryptoLib.decrypt(fs.readFileSync(SESSION_FILE, 'utf8')));
-    if (s && cryptoLib.isExpired(s.updatedAt)) { try { fs.unlinkSync(SESSION_FILE); } catch {} return null; }
-    return s;
-  } catch {
-    return null;
-  }
+  sessionLib.removeLegacyProfile(PROFILE_DIR);
+  const s = sessionLib.read(SESSION_FILE);
+  if (!s) sessionLib.clear([STORAGE_FILE]);
+  return s;
 }
-
 function saveSession(s) {
-  ensureDir(HOME_DIR);
-  fs.writeFileSync(SESSION_FILE, cryptoLib.encrypt(JSON.stringify({ ...s, updatedAt: new Date().toISOString() }, null, 2)));
+  const {cookie, ...identity} = s;
+  sessionLib.write(SESSION_FILE, identity);
 }
-
-// 组装完整 cookie 串：新格式 session.cookie 已含 access_token=；旧格式只有 PHPSESSID，则合并 storage-state.json 补齐
-function fullCookie(session) {
-  const c = (session && session.cookie) || '';
-  if (c && c.includes('access_token=')) return c;
-  const parts = [];
-  if (c) parts.push(`PHPSESSID=${c}`);
-  try {
-    const st = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
-    for (const k of (st.cookies || [])) parts.push(`${k.name}=${k.value}`);
-  } catch { /* 无 storage-state 则忽略 */ }
-  return parts.join('; ');
+function fullCookie(session, target = BASE + '/') {
+  if (!session) return '';
+  return sessionLib.cookieHeader(sessionLib.read(STORAGE_FILE), target);
 }
-
-// 从 storage-state.json / session.json 取出结构化 cookie，用于注入到浏览器上下文（修复 open/orders 打开后未登录）
 function cookiePairsFromStorage() {
-  const pairs = [];
-  // 1) 优先 storage-state.json（login 时由 context.storageState 保存，含 domain/path/expires）
-  try {
-    const st = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
-    for (const c of (st.cookies || [])) {
-      pairs.push({
-        name: c.name, value: c.value, domain: c.domain, path: c.path || '/',
-        expires: c.expires, httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || 'Lax',
-      });
-    }
-  } catch { /* 忽略 */ }
-  if (pairs.length) return pairs;
-  // 2) 兜底：解析 session.json 的完整 cookie 串，绑定到本站域
-  const s = loadSession();
-  const cstr = (s && s.cookie) || '';
-  if (!cstr) return [];
-  for (const part of cstr.split(';')) {
-    const eq = part.indexOf('=');
-    if (eq <= 0) continue;
-    pairs.push({
-      name: part.slice(0, eq).trim(), value: part.slice(eq + 1).trim(),
-      domain: '.tsinghua.edu.cn', path: '/', secure: true, httpOnly: false, sameSite: 'Lax',
-    });
-  }
-  return pairs;
+  if (!loadSession()) return [];
+  return (sessionLib.read(STORAGE_FILE)?.cookies || []).filter(c => c.expires == null || c.expires === -1 || c.expires*1000 > Date.now());
 }
-
 async function restoreContextCookies(context) {
   const cookies = cookiePairsFromStorage();
-  if (cookies.length) {
-    try { await context.addCookies(cookies); } catch { /* 注入失败则忽略，仍按未登录处理 */ }
-  }
+  if (cookies.length) await context.addCookies(cookies);
 }
+function cmdLogout() {
+  sessionLib.clear([SESSION_FILE, STORAGE_FILE], PROFILE_DIR);
+  console.log('已清除本地登录态');
+}
+async function persistStorage(context) {
+  const s = loadSession();
+  if (!s) throw new Error('登录态未保存');
+  sessionLib.write(STORAGE_FILE, {...await context.storageState(), updatedAt: s.updatedAt});
+}
+
 
 function out(obj, json) {
   // 输出脱敏：token/cookie 替换为 <redacted>，避免泄漏到 stdout
@@ -204,8 +176,9 @@ function err(msg, code = 1) {
 
 async function httpGet(url, cookie) {
   const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) seat-helper' };
-  if (cookie) headers['Cookie'] = cookie; // 完整 cookie 串（PHPSESSID/access_token/userid 缺一不可）
-  const resp = await fetch(url, { headers, redirect: 'follow' });
+  if (cookie) headers['Cookie'] = sessionLib.cookieHeader(sessionLib.read(STORAGE_FILE), url); // 完整 cookie 串（PHPSESSID/access_token/userid 缺一不可）
+  const resp = await fetch(url, { headers, redirect: 'error', signal: AbortSignal.timeout(20000) });
+  if (!resp.ok) throw new Error('HTTP 请求失败：' + resp.status);
   const text = await resp.text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* 非 JSON（HTML 页） */ }
@@ -219,8 +192,9 @@ async function httpPost(url, form, cookie) {
     'Content-Type': 'application/x-www-form-urlencoded',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) seat-helper',
   };
-  if (cookie) headers['Cookie'] = cookie; // 完整 cookie 串
-  const resp = await fetch(url, { method: 'POST', headers, body: body.toString(), redirect: 'follow' });
+  if (cookie) headers['Cookie'] = sessionLib.cookieHeader(sessionLib.read(STORAGE_FILE), url); // 完整 cookie 串
+  const resp = await fetch(url, { method: 'POST', headers, body: body.toString(), redirect: 'error', signal: AbortSignal.timeout(20000) });
+  if (!resp.ok) throw new Error('HTTP 请求失败：' + resp.status);
   const text = await resp.text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* 非 JSON */ }
@@ -245,12 +219,13 @@ async function cmdAreas(json) {
     let total = 0, used = 0, floors = [];
     try {
       const r = await httpGet(`${BASE}/api.php/v3areas/${lib.id}`);
+      if (r.json?.status !== 1 || !Array.isArray(r.json?.data?.list?.childArea)) throw new Error('馆舍数据无效');
       const child = (r.json && r.json.data && r.json.data.list && r.json.data.list.childArea) || [];
       floors = child.filter((c) => c.type === 0 && c.isValid === 1).map((c) => ({
         id: c.id, name: c.name, total: c.TotalCount, available: c.TotalCount - c.UnavailableSpace,
       }));
       for (const f of floors) { total += f.total; used += f.total - f.available; }
-    } catch { /* 网络失败则保留静态名 */ }
+    } catch { throw new Error('馆舍空座查询失败，不能按零空座处理'); }
     list.push({ id: lib.id, name: lib.name, enname: lib.enname, intro: LIB_INTRO[lib.id] || '', total, used, available: total - used, floors });
   }
   if (json) { out({ ok: true, libraries: list }, true); return; }
@@ -329,13 +304,15 @@ async function cmdTree(libId, date, json) {
     let floors = [];
     try {
       const r = await httpGet(`${BASE}/api.php/v3areas/${lib.id}`);
+      if (r.json?.status !== 1 || !Array.isArray(r.json?.data?.list?.childArea)) throw new Error('馆舍数据无效');
       floors = (r.json && r.json.data && r.json.data.list && r.json.data.list.childArea || [])
         .filter((c) => c.type === 0 && c.isValid === 1);
-    } catch { /* 跳过网络失败的馆舍 */ }
+    } catch { throw new Error('馆舍查询失败，未取得完整结果'); }
     for (const f of floors) {
       const floorNode = { id: f.id, name: f.name, facilities: FLOOR_FACILITIES[f.id] || '', total: f.TotalCount, available: f.TotalCount - f.UnavailableSpace, sections: [] };
       try {
         const fr = await httpGet(`${BASE}/api.php/v3areas/${f.id}/date/${day}`);
+        if (fr.json?.status !== 1 || !Array.isArray(fr.json?.data?.list?.childArea)) throw new Error('楼层数据无效');
         const areas = (fr.json && fr.json.data && fr.json.data.list && fr.json.data.list.childArea || [])
           .filter((c) => c.type === 1);
         for (const a of areas) {
@@ -347,7 +324,7 @@ async function cmdTree(libId, date, json) {
             segment: seg ? seg.id : null, startTime: seg ? seg.startTime : null, endTime: seg ? seg.endTime : null,
           });
         }
-      } catch { /* 跳过该楼层 */ }
+      } catch { throw new Error('楼层查询失败，未取得完整结果'); }
       libNode.floors.push(floorNode);
       await new Promise((r) => setTimeout(r, 80)); // 轻微限流
     }
@@ -444,7 +421,7 @@ async function cmdStatus(json) {
     const r = await httpGet(`${BASE}/home/web/f_second`, fullCookie(s));
     const ska = parseSka(r.raw);
     loggedIn = !!ska.access_token;
-  } catch { /* 网络失败时信任本地会话 */ }
+  } catch { err('无法验证登录态，请检查网络后重试'); }
   if (json) out({ ok: true, loggedIn, username: s.username, userid: s.userid, updatedAt: s.updatedAt }, true);
   else out(loggedIn ? `已登录：${s.username}（userid=${s.userid}）` : '登录已过期，请重新 login');
   process.exit(loggedIn ? 0 : 2);
@@ -453,28 +430,29 @@ async function cmdStatus(json) {
 // ---------------- 浏览器命令 ----------------
 
 function launchPersistent() {
+  loadSession();
   const { chromium } = require('playwright');
   const base = { headless: false, viewport: { width: 1400, height: 950 }, locale: 'zh-CN' };
   return (async () => {
     // 优先系统 Edge → Chrome；两者都找不到才回退 Chromium
     for (const channel of ['msedge', 'chrome']) {
       try {
-        return await chromium.launchPersistentContext(PROFILE_DIR, { ...base, channel });
+        return await sessionLib.launch(chromium, { ...base, channel }, STORAGE_FILE, PROFILE_DIR);
       } catch (e) {
         // 浏览器存在但被沙箱拦截（spawn EPERM）→ 立即提示升级权限，不继续回退、不装 Chromium
         if (/EPERM|permission|not permitted/i.test(String((e && e.message) || e))) {
-          err('启动系统浏览器被沙箱拦截（spawn EPERM）：系统 Edge/Chrome 存在但无法启动。请下次运行前先以更宽权限（danger-full-access）提权再运行本命令；不要安装 Chromium。');
+          err('启动系统浏览器被沙箱拦截（spawn EPERM）：系统 Edge/Chrome 存在但无法启动。请通过当前宿主申请启动浏览器所需的最小权限后重试；不要安装 Chromium。');
         }
         // 其它原因（如未安装该浏览器）→ 尝试下一个
       }
     }
     try {
-      return await chromium.launchPersistentContext(PROFILE_DIR, base);
+      return await sessionLib.launch(chromium, base, STORAGE_FILE, PROFILE_DIR);
     } catch (e) {
       if (/EPERM|permission|not permitted/i.test(String((e && e.message) || e))) {
-        err('启动浏览器被沙箱拦截（spawn EPERM）。请下次运行前先以更宽权限（danger-full-access）提权再运行本命令；不要安装 Chromium。');
+        err('启动浏览器被沙箱拦截（spawn EPERM）。请通过当前宿主申请启动浏览器所需的最小权限后重试；不要安装 Chromium。');
       }
-      err('启动浏览器失败：' + ((e && e.message) || String(e)) + '（优先用系统 Edge/Chrome；若为沙箱拦截 spawn EPERM，请下次运行前先以 danger-full-access 提权再运行，不要安装 Chromium）');
+      err('启动浏览器失败：' + ((e && e.message) || String(e)) + '（优先用系统 Edge/Chrome；若为沙箱拦截 spawn EPERM，请申请当前宿主允许的最小启动权限后重试，不要安装 Chromium）');
     }
   })();
 }
@@ -490,7 +468,8 @@ async function extractSessionFromPage(page) {
   } catch { return { access_token: '', userid: '', username: '' }; }
 }
 
-async function cmdLogin() {
+async function cmdLogin(opt = {}) {
+  if (opt.force) cmdLogout();
   ensureDir(HOME_DIR);
   const context = await launchPersistent();
   await restoreContextCookies(context); // 恢复已保存的登录 Cookie
@@ -504,7 +483,7 @@ async function cmdLogin() {
     const cookies = await context.cookies();
     const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
     saveSession({ ...ska, cookie: cookieStr });
-    await context.storageState({ path: STORAGE_FILE }).catch(() => {});
+    await persistStorage(context);
     console.log(`已复用现有登录会话：${ska.username}（userid=${ska.userid}）`);
     await context.close();
     return;
@@ -522,7 +501,7 @@ async function cmdLogin() {
       const cookies = await context.cookies();
       const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
       saveSession({ ...ska, cookie: cookieStr });
-      await context.storageState({ path: STORAGE_FILE }).catch(() => {});
+      await persistStorage(context);
       console.log(`登录成功：${ska.username}（userid=${ska.userid}）`);
       await context.close();
       return;
@@ -639,6 +618,7 @@ function parseBookings(html) {
 async function cmdBookings(json) {
   const s = requireLogin();
   const r = await httpGet(`${BASE}/user/index/book`, fullCookie(s));
+  if (r.status !== 200 || !parseSka(r.raw).access_token) throw new Error('预约列表未能确认登录状态，不能按无记录处理');
   const bookings = parseBookings(r.raw);
   if (bookings.length === 0) {
     if (json) { out({ ok: true, bookings: [] }, true); return; }
@@ -657,7 +637,7 @@ async function cmdBookings(json) {
 async function doCancelAPI(s, id) {
   const body = { _method: 'delete', id, userid: s.userid, access_token: s.access_token, operateChannel: 2 };
   const r = await httpPost(`${BASE}/api.php/profile/books/${id}`, body, fullCookie(s));
-  if (r.json && (r.json.status === 1 || (r.json.msg && !/失败|错误|异常/.test(r.json.msg)))) {
+  if (r.json && r.json.status === 1) {
     out(`取消成功：${r.json.msg || '已取消预约'}`);
   } else {
     err('取消失败：' + (r.json ? (r.json.msg || JSON.stringify(r.json)) : r.raw.slice(0, 300)));
@@ -666,24 +646,14 @@ async function doCancelAPI(s, id) {
 
 async function cmdCancel(opt) {
   const s = requireLogin();
-
-  // 未指定 --id：自动获取预约列表，取消第一条（须 --yes）
-  if (!opt.id) {
-    const r = await httpGet(`${BASE}/user/index/book`, fullCookie(s));
-    const bookings = parseBookings(r.raw);
-    if (bookings.length === 0) { out('暂无预约记录（或会话过期，请重新 login）。'); return; }
-    const target = bookings[0];
-    if (!opt.yes) {
-      out(`检测到 ${bookings.length} 条预约，将取消第一条：id=${target.id}（${target.space}，${target.start}~${target.end}）。\n确认后加 --yes 真正取消。全部预约：`);
-      for (const b of bookings) out(`  id=${b.id}｜${b.space}｜${b.start}~${b.end}｜${b.status}`);
-      return;
-    }
-    return await doCancelAPI(s, target.id);
-  }
-
-  // 指定 --id：直接 API 取消
-  if (!opt.yes) { out(`[预演] 将取消预约 id=${opt.id}。确认后加 --yes 真正提交。`); return; }
-  return await doCancelAPI(s, opt.id);
+  if (!opt.id) throw new Error('请先查询预约并指定 --id，不能自动取消第一条');
+  if (opt['dry-run'] && opt.yes) throw new Error('--yes 与 --dry-run 不能同时使用');
+  const r = await httpGet(`${BASE}/user/index/book`, fullCookie(s));
+  if (r.status !== 200 || !parseSka(r.raw).access_token) throw new Error('未能验证预约列表');
+  const target = parseBookings(r.raw).find(b => b.id === String(opt.id));
+  if (!target) throw new Error('未找到指定预约，已停止取消');
+  if (!opt.yes) { out(`[预演] 将取消 ${target.space} ${target.start}~${target.end}，id=${target.id}`); return; }
+  return doCancelAPI(s, target.id);
 }
 
 // ---------------- setup ----------------
@@ -691,13 +661,13 @@ async function cmdCancel(opt) {
 async function cmdSetup(opt) {
   const skillRoot = path.resolve(__dirname, '..');
   const pkgPath = path.join(skillRoot, 'package.json');
-  const pkg = {
-    name: 'thu-lib-seat-reserve',
-    version: '1.1.0',
-    private: true,
-    allowScripts: { playwright: true },
-    dependencies: { playwright: '1.62.1' },
-  };
+  const pkg = fs.existsSync(pkgPath) ? JSON.parse(fs.readFileSync(pkgPath, 'utf8')) : {};
+  pkg.name ||= 'thu-auto-reserve';
+  pkg.version ||= '1.2.0';
+  pkg.private = true;
+  pkg.allowScripts = {...(pkg.allowScripts || {}), playwright:true};
+  pkg.dependencies = {...(pkg.dependencies || {}), playwright:'1.62.1'};
+  pkg.engines = {...(pkg.engines || {}), node:'>=20'};
   fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
   console.log(`已写入 ${pkgPath}（allowScripts 为对象格式）`);
 
@@ -735,6 +705,7 @@ function parseArgs(argv) {
       args._.push(a);
     }
   }
+  if (args.yes && args['dry-run']) throw new Error('--yes 与 --dry-run 不能同时使用');
   return args;
 }
 
@@ -752,7 +723,8 @@ function parseArgs(argv) {
       case 'sections': return await cmdSections(a.floor, a.date, a.json);
       case 'slots': return await cmdSlots(a.floor, a.date, a.section, a.json);
       case 'status': return await cmdStatus(a.json);
-      case 'login': return await cmdLogin();
+      case 'login': return await cmdLogin(a);
+      case 'logout': return cmdLogout();
       case 'open': return await cmdOpen(a);
       case 'orders': return await cmdOrders();
       case 'bookings': return await cmdBookings(a.json);
@@ -763,7 +735,7 @@ function parseArgs(argv) {
         err('用法：\n' +
           '  数据：areas | tree [--lib <id>] [--date] | floors --lib <id> | days --area <id> | sections --floor <id> [--date] | slots --floor <id> [--date] [--section <id>] | status | bookings  （均可加 --json）\n' +
           '  浏览器：setup | login | open --lib <id> | open --floor <id> [--date] | open --section <阅览区id> [--date] | orders\n' +
-          '  预约/取消：reserve --seat <座位id> --segment <时段id> [--yes]（调试兜底） | cancel [--id <预约id>] [--yes]（不指定 --id 自动取消第一条）');
+          '  预约/取消：reserve --seat <座位id> --segment <时段id> [--yes]（调试兜底） | cancel [--id <预约id>] [--yes]（必须指定 --id）');
     }
   } catch (e) {
     err('执行出错：' + (e && e.message ? e.message : String(e)));

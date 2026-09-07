@@ -14,7 +14,7 @@
  *   node scripts/venue-helper.js orders [--uuid <resvUuid>]   # 列出我的预约记录（--uuid 只查某一条）
  *   node scripts/venue-helper.js cancel --uuid <resvUuid> [--yes]   # 取消预约（已实测成功；--yes 才真正提交）
  *   node scripts/venue-helper.js reserve --scene <名称|uuid> [--date YYYY-MM-DD] [--time HH:mm]  # 打开预约页并自动选日期/时段，人机验证及后续由用户完成
- *   node scripts/venue-helper.js reserve-api --scene <名称|uuid> --date YYYY-MM-DD --time HH:mm [--yes --captcha <token>]  # 纯 API 预约；提交需滑块验证码 token（前端有 blockPuzzle 人机验证），成功后自动开付款窗口
+ *   node scripts/venue-helper.js reserve-api --scene <名称|uuid> --date YYYY-MM-DD --time HH:mm [--yes --captcha-stdin]  # 纯 API 预约；提交需滑块验证码 token（前端有 blockPuzzle 人机验证），成功后自动开付款窗口
  *   node scripts/venue-helper.js pay                   # 打开浏览器到预约记录页，让用户完成支付
  *   node scripts/venue-helper.js open [--url <hash路由>]     # 打开场馆网站（有头浏览器）
  *   node scripts/venue-helper.js lottery --scene <名称|uuid>             # 列出该场景的抽签报名场次
@@ -46,7 +46,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const cryptoLib = require('./lib/crypto'); // 会话文件加密（最小改动，防文件被拷走；storage-state/browser-profile 暂不加密）
+const cryptoLib = require('./lib/crypto');
+const sessionLib = require('./lib/session');
+const bj = require('./lib/beijing');
+cryptoLib.installRedaction();
 
 const VENUE_URL = 'https://www.sports.tsinghua.edu.cn/venue/';
 const API_BASE = 'https://www.sports.tsinghua.edu.cn/venue/site';
@@ -110,23 +113,27 @@ function decryptAes(cipherB64) {
 }
 
 function fmtDate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  return bj.date(d.getTime());
 }
 
 function readTokenFile() {
-  try {
-    const o = JSON.parse(cryptoLib.decrypt(fs.readFileSync(TOKEN_FILE, 'utf8')));
-    if (o && cryptoLib.isExpired(o.updatedAt)) { try { fs.unlinkSync(TOKEN_FILE); } catch {} return null; }
-    return o;
-  } catch { return null; }
+  sessionLib.removeLegacyProfile(PROFILE_DIR);
+  const token = sessionLib.read(TOKEN_FILE);
+  if (!token) sessionLib.clear([STORAGE_STATE_FILE]);
+  return token;
 }
-function writeTokenFile(obj) {
-  fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
-  fs.writeFileSync(TOKEN_FILE, cryptoLib.encrypt(JSON.stringify(obj, null, 2)));
+
+function writeTokenFile(obj) { sessionLib.write(TOKEN_FILE, obj); }
+async function persistStorageState(context) {
+  const token = readTokenFile();
+  if (!token) throw new Error('登录态未保存');
+  sessionLib.write(STORAGE_STATE_FILE, {...await context.storageState(), updatedAt: token.updatedAt});
 }
+function clearLocalSession() {
+  sessionLib.clear([TOKEN_FILE, STORAGE_STATE_FILE], PROFILE_DIR);
+}
+async function cmdLogout() { clearLocalSession(); console.log('已清除本地登录态'); }
+
 
 /** 读取场景上下文缓存（devKind/building/sceneUseType，按 sceneUuid 键） */
 function readContextCache() {
@@ -154,13 +161,15 @@ function parseArgs(argv) {
       flags.add(a.slice(1));
     }
   }
+  if (args.yes !== undefined && args.yes !== true) throw new Error('--yes 必须为独立开关');
+  if (args.yes && args['dry-run']) throw new Error('--yes 与 --dry-run 不能同时使用');
   return { args, flags };
 }
 
 /** 统一输出：--json 时输出单行 JSON，否则输出人类可读文本；随后按退出码退出 */
 function output(result, json) {
   // 输出脱敏：token/Cookie 替换为 <redacted>，避免泄漏到 stdout/stderr/日志
-  const scr = (s) => { const t = readTokenFile(); return cryptoLib.scrub(s, [t && t.token]); };
+  const scr = (s) => cryptoLib.scrub(s);
   if (json) {
     const o = { ok: result.code === EXIT_OK, code: result.code };
     if (result.message !== undefined) o.message = result.message;
@@ -190,10 +199,16 @@ function playwright() {
   return _pw;
 }
 
+async function launchSession(chromium, options) {
+  readTokenFile();
+  const context = await sessionLib.launch(chromium, options, STORAGE_STATE_FILE, PROFILE_DIR);
+  return context;
+}
+
 async function launchContext(headless) {
   await acquireProfileLock(); // 互斥锁：并行调用排队等待，而非直接启动失败
   const { chromium } = playwright();
-  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  sessionLib.removeLegacyProfile(PROFILE_DIR);
   const base = {
     headless: !!headless,
     viewport: { width: 1280, height: 800 },
@@ -204,15 +219,15 @@ async function launchContext(headless) {
   let lastErr = null;
   for (const channel of channels) {
     try {
-      return await chromium.launchPersistentContext(PROFILE_DIR, { ...base, channel });
+      return await launchSession(chromium, { ...base, channel });
     } catch (e) { lastErr = e; }
   }
   // 都不可用再退回 Playwright 自带 Chromium（需要 npx playwright install chromium）
   try {
-    return await chromium.launchPersistentContext(PROFILE_DIR, base);
+    return await launchSession(chromium, base);
   } catch (e) {
     if (/EPERM|permission|not permitted/i.test(String((e && e.message) || (lastErr && lastErr.message) || ''))) {
-      console.error('[错误] 启动浏览器被沙箱拦截（spawn EPERM）：系统 Chrome/Edge 存在但无法启动。请下次运行前先以更宽权限（danger-full-access）提权再运行；不要安装 Chromium。');
+      console.error('[错误] 启动浏览器被沙箱拦截（spawn EPERM）：系统 Chrome/Edge 存在但无法启动。请通过当前宿主申请启动浏览器所需的最小权限后重试；不要安装 Chromium。');
       throw lastErr || e;
     }
     console.error('[错误] 未能启动浏览器。请确认已安装 Google Chrome 或 Microsoft Edge，');
@@ -266,11 +281,11 @@ async function ensureToken(context, { waitMs = 4000 } = {}) {
  */
 async function checkExistingLogin() {
   const { chromium } = playwright();
-  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  sessionLib.removeLegacyProfile(PROFILE_DIR);
   for (const channel of ['chrome', 'msedge']) {
     let context = null;
     try {
-      context = await chromium.launchPersistentContext(PROFILE_DIR, { headless: true, channel });
+      context = await launchSession(chromium, { headless: true, channel });
       const page = await context.newPage();
       await page.goto(VENUE_URL + '#/home', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(2500);
@@ -278,7 +293,7 @@ async function checkExistingLogin() {
       if (token) {
         const refreshToken = await page.evaluate(() => localStorage.getItem('refreshToken'));
         writeTokenFile({ token, refreshToken: refreshToken ? JSON.parse(refreshToken) : null, updatedAt: new Date().toISOString() });
-        try { fs.writeFileSync(STORAGE_STATE_FILE, JSON.stringify(await context.storageState(), null, 2)); } catch {}
+        await persistStorageState(context);
         return { token, channel };
       }
     } catch { /* 该浏览器不可用或无会话，尝试下一个 */ }
@@ -1044,7 +1059,7 @@ function ensurePackageJson() {
   try { pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')); } catch { pkg = {}; }
   if (typeof pkg !== 'object' || Array.isArray(pkg)) pkg = {};
   if (!pkg.name) pkg.name = 'thu-auto-reserve';
-  if (!pkg.version) pkg.version = '1.1.0';
+  if (!pkg.version) pkg.version = '1.2.0';
   pkg.private = true;
   const prev = (pkg.allowScripts && typeof pkg.allowScripts === 'object' && !Array.isArray(pkg.allowScripts)) ? pkg.allowScripts : {};
   pkg.allowScripts = { ...prev, playwright: true }; // 对象格式：{"playwright": true}
@@ -1101,6 +1116,7 @@ async function cmdSetup(argv) {
 async function cmdLogin(argv) {
   const { args } = parseArgs(argv);
   const json = !!args.json;
+  if (args.force) clearLocalSession();
 
   // 1) 先检查 Chrome / Edge 两个浏览器是否已有登录会话，避免重复登录
   if (!json) console.log('正在检查 Chrome / Edge 是否已有登录会话…');
@@ -1142,7 +1158,7 @@ async function cmdLogin(argv) {
   const refreshToken = await page.evaluate(() => localStorage.getItem('refreshToken'));
   writeTokenFile({ token, refreshToken: refreshToken ? JSON.parse(refreshToken) : null, updatedAt: new Date().toISOString() });
   // 额外保存完整 storageState（含 Cookie），供「无浏览器」查询路径复用
-  try { fs.writeFileSync(STORAGE_STATE_FILE, JSON.stringify(await context.storageState(), null, 2)); } catch {}
+  await persistStorageState(context);
   if (!json) {
     console.log('✅ 登录成功，会话已保存到 ' + PROFILE_DIR);
     console.log('   token 已缓存到 ' + TOKEN_FILE);
@@ -1164,11 +1180,9 @@ function readCachedToken() {
 }
 
 /** 从 storageState 提取 Cookie 头（供纯 HTTP 请求复用登录会话） */
-function loadCookieHeader() {
-  try {
-    const state = JSON.parse(fs.readFileSync(STORAGE_STATE_FILE, 'utf8'));
-    return (state.cookies || []).map((c) => `${c.name}=${c.value}`).join('; ');
-  } catch { return ''; }
+function loadCookieHeader(target = API_BASE) {
+  if (!readTokenFile()) return '';
+  return sessionLib.cookieHeader(sessionLib.read(STORAGE_STATE_FILE), target);
 }
 
 /**
@@ -1183,10 +1197,11 @@ function getApiClient() {
       const qs = new URLSearchParams(params).toString();
       const full = qs ? `${url}${url.includes('?') ? '&' : '?'}${qs}` : url;
       const h = { ...headers };
-      h['Cookie'] = loadCookieHeader();
+      h['Cookie'] = loadCookieHeader(full);
       h['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
       const body = data === undefined || data === null ? undefined : (typeof data === 'string' ? data : JSON.stringify(data));
-      const resp = await globalThis.fetch(full, { method, headers: h, body });
+      const resp = await globalThis.fetch(full, { method, headers: h, body, redirect: 'error', signal: AbortSignal.timeout(20000) });
+      if (!resp.ok) throw new Error('HTTP 请求失败：' + resp.status);
       const text = await resp.text();
       return { text: async () => text };
     },
@@ -1381,7 +1396,7 @@ async function cmdSlots(argv) {
   }
 
   // 默认从「明天」起查：当天数据含实时占用，响应大且慢（游泳馆当天 ~6s/50KB），预约场景一般关心未来
-  const startDate = args.date ? new Date(args.date) : new Date(Date.now() + 24 * 3600 * 1000);
+  const startDate = args.date ? new Date(bj.parse(args.date) + 'T00:00:00+08:00') : new Date(Date.now() + 24 * 3600 * 1000);
   // 天数：--date 且未给 --days 时只查 1 天；否则 --days 或默认未来 3 天（接口限 1 并发）
   const maxDays = (args.date && args.days == null)
     ? 1
@@ -1652,11 +1667,14 @@ async function findFutureOrders(context, token) {
 async function cmdReserveApi(argv) {
   const { args } = parseArgs(argv);
   const json = !!args.json;
+  if (args.captcha) throw new Error('验证码不得放入命令行，请使用 --captcha-stdin');
+  const captcha = args['captcha-stdin'] ? fs.readFileSync(0, 'utf8').trim() : '';
+  cryptoLib.remember(captcha);
   const sceneArg = args.scene;
   const dateStr = args.date || '';
   const timeStr = args.time || '';
   if (!sceneArg || !dateStr || !timeStr) {
-    return output({ code: EXIT_FAIL, message: '缺少参数：reserve-api --scene <名称|uuid> --date YYYY-MM-DD --time HH:mm [--yes --captcha <token>]' }, json);
+    return output({ code: EXIT_FAIL, message: '缺少参数：reserve-api --scene <名称|uuid> --date YYYY-MM-DD --time HH:mm [--yes --captcha-stdin]' }, json);
   }
   const token = readCachedToken();
   if (!token) return output({ code: EXIT_UNAUTH, message: '未登录，请先运行 login' }, json);
@@ -1724,7 +1742,7 @@ async function cmdReserveApi(argv) {
     payType: 'PAY_ONLINE',
     purchaseUuid: '',
     formParam: { formId: formUuid, deployUuid, variables: {}, chooseCandidates: {} },
-    captcha: args.captcha || '',
+    captcha,
   };
   await context.close();
 
@@ -1732,13 +1750,13 @@ async function cmdReserveApi(argv) {
     return output({
       code: EXIT_OK,
       data: { dryRun: true, sceneName: picked.scene.sceneName, reserveTime: picked.reserveTime, body },
-      text: `【预演，未提交】将预约：${picked.scene.sceneName} ${dateStr} ${timeStr}~${picked.sess.endTime}\n${JSON.stringify(body, null, 2)}\n（真正提交需 --yes 且带 --captcha <滑块验证码token>，token 由完成人机验证后取得）`,
+      text: `【预演，未提交】将预约：${picked.scene.sceneName} ${dateStr} ${timeStr}~${picked.sess.endTime}\n${JSON.stringify(body, null, 2)}\n（真正提交需 --yes 且带 --captcha-stdin，token 由完成人机验证后取得）`,
     }, json);
   }
 
   // 5) 真正提交（必须有滑块验证码 token）
-  if (!args.captcha) {
-    return output({ code: EXIT_FAIL, message: '提交预约需要 --captcha <滑块验证码token>（前端有 blockPuzzle 人机验证，无法纯 API 绕过）' }, json);
+  if (!captcha) {
+    return output({ code: EXIT_FAIL, message: '提交预约需要 --captcha-stdin（前端有 blockPuzzle 人机验证，无法纯 API 绕过）' }, json);
   }
   const c2 = await getApiClient();
   const r = await apiCallWithRetry(c2, token, 'POST', '/api/reserve/addReserve', {}, body);
@@ -1763,7 +1781,7 @@ async function cmdReserve(argv) {
   const { args } = parseArgs(argv);
   const json = !!args.json;
   const sceneArg = args.scene;
-  const dateStr = args.date || '';   // 可选，如 2026-08-30
+  const dateStr = args.date ? bj.parse(args.date) : '';   // 可选，如 2026-08-30
   const timeStr = args.time || '';   // 可选，开始时间，如 20:00
   if (!sceneArg) return output({ code: EXIT_FAIL, message: '缺少 --scene 参数' }, json);
 
@@ -1847,6 +1865,7 @@ async function cmdReserve(argv) {
         return false;
       }, mmdd);
     } catch { /* 超时 */ }
+    if (!ok) { await browser.close(); throw new Error('未能选中指定日期，已停止后续操作'); }
     if (!json) console.log(ok ? `✅ 已点选日期 ${mmdd}` : `⚠️ 未找到可用日期 ${mmdd}（已等 30s），请手动点选`);
     await page.waitForTimeout(1000);
   }
@@ -1874,6 +1893,7 @@ async function cmdReserve(argv) {
         return false;
       }, timeStr);
     } catch { /* 超时 */ }
+    if (!ok) { await browser.close(); throw new Error('未能选中指定时段，已停止后续操作'); }
     if (!json) console.log(ok ? `✅ 已点选时段 ${timeStr}` : `⚠️ 未找到可约时段 ${timeStr}，请手动点选`);
     await page.waitForTimeout(1000);
   }
@@ -1940,6 +1960,7 @@ async function cmdPay(argv) {
 // 入口
 // ---------------------------------------------------------------------------
 const commands = {
+  logout: cmdLogout,
   setup: cmdSetup,
   login: cmdLogin,
   status: cmdStatus,

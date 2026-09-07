@@ -1,1 +1,2 @@
-cryptography
+# Core activity-room client uses Python 3.10+ standard library and Windows DPAPI.
+# Optional UI helper dependencies: requirements-ui.txt

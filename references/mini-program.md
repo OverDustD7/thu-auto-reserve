@@ -1,3 +1,5 @@
+> 本文保留原 UI 调研记录；当前凭证获取和操作边界以 [活动室客户端](wechat-room-api.md) 为准。v1.2.0 不再扫描微信进程。
+
 # 学生清华小程序 · 活动室申请（逆向笔记）
 
 > 目标：在微信客户端（PC 版 Weixin 4.x）的「学生清华」小程序里，实现**抓取活动室数据 + 自动申请活动室**。
@@ -19,8 +21,8 @@
 1. **小程序包是加密的**：`.wxapkg` 魔数为 `V1MMWX`（微信 4.x 新加密格式），离线解包需运行时 key，**无法静态直接逆向**。
 2. **名称映射库也是加密的**：`applet.db` 为 WCDB 加密（表头非标准 SQLite），读不出「AppID ↔ 名称」。
 3. **UIAutomation 读不到小程序内部**：只暴露根窗口（`Chrome_WidgetWin_0`），Chromium 默认关闭无障碍树。
-4. **最终实现 = 逆向出后端 API 直连**（`student.tsinghua.edu.cn/v2/api`，详见 `references/wechat-room-api.md`）：**读微信进程内存提取 jwt + 直连 HTTP**，完成查询/推荐/占用/可约/申请/撤销，**无需模拟点击**。
-   - 鉴权：`Authorization: Bearer <jwt>`；jwt 从运行中的微信进程(WeChatAppEx)`内存按 ASCII` 提取（搜 `eyJ...`），失败回退本地保存（~7 天过期）。
+4. **最终实现 = 逆向出后端 API 直连**（`student.tsinghua.edu.cn/v2/api`，详见 `references/wechat-room-api.md`）：**显式导入本人登录态 + 直连 HTTP**，完成查询/推荐/占用/可约/申请/撤销，**无需模拟点击**。
+   - 鉴权：`Authorization: Bearer <jwt>`；登录态通过 `login --card` 显式导入并由 DPAPI 保存，最长七天；不读取微信进程内存。
    - **无需小程序窗口常开**：查询/申请/撤销都是 API，只需有效 jwt；仅 jwt 过期(~7天)时在微信里刷新一次。`activityTarget=school` 全校通用（C楼/南区/胜因院），`activityType` 映射：党团=party/社团=organization/体育赛事=sports/学术报告=academy/文化活动=culture/文艺活动=art/其它活动=others。
    - UI 截图+点击仅作**兜底**：`PrintWindow(PW_RENDERFULLCONTENT)` 抓窗口、**必须 DPI-aware**（1.5x 缩放）、`SetWindowPos(TOPMOST)` 防遮挡。
 
@@ -75,7 +77,7 @@
 
 ## 六、主脚本（已交付）
 
-**主脚本 = `scripts/wechat-room-api.py`**（API 直连）：`check / jwt / list / occupancy / recommend / avail / apply / cancel / mine`，鉴权 `Bearer <jwt>`（微信进程内存自动提取，失败回退本地保存 ~7 天；提取时用服务端校验、避开已吊销旧 token）。`recommend --purpose 活动用途` 按用途匹配房间（一般用途避开录音/导播/舞蹈/排练等专属功能房）；`apply` 两步提交（ticketId 在 `Location` 头），`activityType` 7 类映射见 `references/wechat-room-api.md`。申请流程/字段规则见 `SKILL.md` 第八节。
+**主脚本 = `scripts/wechat-room-api.py`**（API 直连）：`check / jwt / list / occupancy / recommend / avail / apply / cancel / mine`，鉴权 `Bearer <jwt>`（显式导入后复用加密会话，最长七天；使用前由服务端验证）。`recommend --purpose 活动用途` 按用途匹配房间（一般用途避开录音/导播/舞蹈/排练等专属功能房）；`apply` 两步提交（ticketId 在 `Location` 头），`activityType` 7 类映射见 `references/wechat-room-api.md`。申请流程/字段规则见 `SKILL.md` 第八节。
 
 **UI 兜底 = `scripts/wechat-room.py`**（个别走不了 API 的动作用截图+点击驱动）：
 

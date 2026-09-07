@@ -1,3 +1,5 @@
+> 资料沿用原项目历史快照（2026 年 8–9 月），本次修改未重新核验线上规则；价格、闭馆、开放与审批/罚则以学校当前公告和实时系统为准。
+
 # 清华图书馆 IC 空间信息（空间推荐知识库）
 
 > 用途：当用户已确定想约的空间类型（研讨间/座位/考研座位等）、但不确定去哪个馆舍或选哪个房间时，据此给出推荐与对比。
@@ -85,7 +87,7 @@
 - 提前天数超限（如今天 08-31 单人研读间约 09-03，超出 3 天最晚 09-02）
 - 同一天已有 1 个有效预约再约第 2 个
 
-> 完整原文见 [`references/lib-space-notices.md`](references/lib-space-notices.md)（`GET /sysInfo?sysType=1&sysValue=<kindId>&sysKind=2&status=2` 实测抓取，共 9 条）。座位/考研座位等模块当前未开放，暂无须知。
+> 完整原文见 [`references/lib-space-notices.md`](lib-space-notices.md)（`GET /sysInfo?sysType=1&sysValue=<kindId>&sysKind=2&status=2` 实测抓取，共 9 条）。座位/考研座位等模块当前未开放，暂无须知。
 
 ## 五、推荐口径建议（供 agent）
 
