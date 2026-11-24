@@ -90,4 +90,4 @@ node scripts/seat-helper.js logout
 
 退出码通常为 0 成功/预演、1 失败、2 未登录。已提交、已支付、审批中和取消部分成功必须区分；不能仅凭错误文案不含“失败”推断成功。凭证脱敏集中处理，新增敏感字段要加入登记；不要保留真实请求或凭证作为测试夹具。
 
-静态资料为原项目历史快照，不能代表本次线上核实结果。规则变动时更新对应 reference、校验器和行为回归。打包时保留 SKILL.md、scripts、references、依赖清单；排除 .git、node_modules、.npm-cache、测试临时文件及任何真实会话。
+静态资料为原项目历史快照，不能代表本次线上核实结果。规则变动时更新对应 reference、校验器和行为回归。打包时保留 LICENSE、SKILL.md、scripts、references、依赖清单；排除 .git、node_modules、.npm-cache、测试临时文件及任何真实会话。

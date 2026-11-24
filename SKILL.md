@@ -1,6 +1,7 @@
 ---
 name: thu-auto-reserve
 description: 帮清华学生和教职工查询、推荐及预约体育场馆、学生活动室、图书馆 IC 空间和自习座位，并查看或取消已有预约。体育验证码与支付、自习选座由本人完成；其他场地仅提供预约渠道指引。
+license: MIT
 metadata:
   compatibility: Windows；Node.js >=20、Python >=3.10；浏览器操作使用 Playwright 与系统 Chrome/Edge。会话由当前 Windows 用户的 DPAPI 保护。活动室需显式导入本人学生清华登录态；不扫描微信进程。
   author: thu-auto-reserve

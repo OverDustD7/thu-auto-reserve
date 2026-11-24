@@ -14,7 +14,7 @@
 | 小程序窗口类 | `Chrome_WidgetWin_0`（Chromium） |
 | 当前用户 | （用户本人，见本地 `~/.thu-sports-venue/` 配置；不写入本技能） |
 | 小程序窗口标题 | 学生清华 |
-| 目录 | `C:\Users\Flash\AppData\Roaming\Tencent\xwechat\radium\users\<u>\applet\packages\` |
+| 目录 | `%WECHAT_DATA_DIR%\applet\packages\` |
 
 ## 二、关键结论
 

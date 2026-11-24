@@ -1486,11 +1486,25 @@ async function cmdReserve(argv) {
   // A user-verified internal account number can instead be supplied with --member-accnos.
   const verifiedAccNos = new Set(String(args['member-accnos'] || '').split(/[,，、\s]+/).filter(Boolean));
   const resvMember = [String(selfAccNo)];
+  const memberNotes = [];
   for (const id of new Set([...members, ...verifiedAccNos])) {
+    // 用户已在页面上核实的内部证号：接口按证号检索通常返回空，且成员列表把学号脱敏
+    // （形如「严家*(*********00)」），无法反查，因此直接采用该证号；有返回时仍交叉核对。
+    if (verifiedAccNos.has(id)) {
+      const rv = await apiCall(ctx,token,'GET','account/getMembers',{key:id,page:1,pageNum:10});
+      const lv = isOk(rv) ? toArray(rv.data) : [];
+      const hit = lv.find(x => String(x.accNo) === String(id));
+      if (lv.length && !hit) throw new Error('成员证号与接口返回不一致，请在页面核对成员');
+      if (!resvMember.includes(String(id))) {
+        resvMember.push(String(id));
+        if (!hit) memberNotes.push(`证号 ${id} 由用户核实后直接采用（接口按证号检索无记录，无法二次核对）`);
+      }
+      continue;
+    }
     const r = await apiCall(ctx,token,'GET','account/getMembers',{key:id,page:1,pageNum:10});
     if (!isOk(r)) throw new Error('成员查询失败，已停止预约');
     const list = toArray(r.data);
-    const hits = list.filter(x => verifiedAccNos.has(id) ? String(x.accNo) === id : [x.logonName,x.card,x.studentId].some(v => v != null && String(v) === id));
+    const hits = list.filter(x => [x.logonName,x.card,x.studentId].some(v => v != null && String(v) === id));
     if (hits.length !== 1 || !hits[0].accNo) throw new Error('成员身份无法精确核实，请在页面核对成员或使用已核实的证号');
     const acc = String(hits[0].accNo);
     if (!resvMember.includes(acc)) resvMember.push(acc);
@@ -1507,12 +1521,12 @@ async function cmdReserve(argv) {
     testName: '', resvProperty: 0, resvDev: [devId], memo: '',
   };
 
-  if (!yes) { await ctx.close(); return output({ code: EXIT_OK, data: { dryRun: true, room: kindName, dev: room.devName, date: dateArg, time: `${timeArg}~${endArg}`, memberCount: resvMember.length, members: resvMember.map(String) }, text: `【预演，未提交】${kindName} / ${room.devName} ${dateArg} ${timeArg}–${endArg}，成员 ${resvMember.length} 人。确认提交请加 --yes` }, json); }
+  if (!yes) { await ctx.close(); return output({ code: EXIT_OK, data: { dryRun: true, room: kindName, dev: room.devName, date: dateArg, time: `${timeArg}~${endArg}`, memberCount: resvMember.length, members: resvMember.map(String), memberNotes }, text: `【预演，未提交】${kindName} / ${room.devName} ${dateArg} ${timeArg}–${endArg}，成员 ${resvMember.length} 人。确认提交请加 --yes` + (memberNotes.length ? '\n' + memberNotes.join('\n') : '') }, json); }
   const submit = await apiCall(ctx, token, 'POST', 'reserve', {}, body);
   await ctx.close();
   if (isAuthError(submit)) return output({ code: EXIT_UNAUTH, message: '登录过期，请重新运行 login' }, json);
   if (!isOk(submit)) return output({ code: EXIT_FAIL, message: '预约失败：' + (submit.message || JSON.stringify(submit)) }, json);
-  return output({ code: EXIT_OK, data: { success: true, resvId: submit.data, room: kindName, dev: room.devName, date: dateArg, time: `${timeArg}~${endArg}`, memberCount: resvMember.length }, text: `✅ 预约成功：${kindName} / ${room.devName} ${dateArg} ${timeArg}–${endArg}（成员 ${resvMember.length} 人）` }, json);
+  return output({ code: EXIT_OK, data: { success: true, resvId: submit.data, room: kindName, dev: room.devName, date: dateArg, time: `${timeArg}~${endArg}`, memberCount: resvMember.length, memberNotes }, text: `✅ 预约成功：${kindName} / ${room.devName} ${dateArg} ${timeArg}–${endArg}（成员 ${resvMember.length} 人）` + (memberNotes.length ? '\n' + memberNotes.join('\n') : '') }, json);
 }
 
 // ---------------------------------------------------------------------------

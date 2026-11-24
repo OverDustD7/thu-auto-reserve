@@ -40,6 +40,20 @@ test('masked candidates never fall back to matching two digits',async()=>{
   await assert.rejects(s.run(`cmdReserve(${JSON.stringify([...args,'--members','1234','--yes'])})`),/精确核实/);
   assert.equal(s.run('posts.length'),0);
 });
+test('user-verified accNo is used when search returns no record (masked ids)',async()=>{
+  const s=space(2);
+  s.run(`const original=apiCall; apiCall=async(...x)=> x[3]==='account/getMembers' ? {code:0,data:[]} : original(...x);`);
+  const r=await s.run(`cmdReserve(${JSON.stringify([...args,'--member-accnos','FIXTURE-ACCOUNT-01','--yes'])})`);
+  assert.equal(r.code,0); assert.equal(s.run('posts.length'),1);
+  assert.deepEqual(Array.from(s.run('posts[0].resvMember')),['SELF','FIXTURE-ACCOUNT-01']);
+  assert.match(String(r.data.memberNotes),/用户核实/);
+});
+test('verified accNo conflicting with the API record is rejected',async()=>{
+  const s=space(2);
+  s.run(`const original=apiCall; apiCall=async(...x)=> x[3]==='account/getMembers' ? {code:0,data:[{accNo:'OTHER'}]} : original(...x);`);
+  await assert.rejects(s.run(`cmdReserve(${JSON.stringify([...args,'--member-accnos','FIXTURE-ACCOUNT-01','--yes'])})`),/不一致/);
+  assert.equal(s.run('posts.length'),0);
+});
 test('ambiguous room names stop before submission',async()=>{
   const s=space(); await assert.rejects(s.run(`cmdReserve(${JSON.stringify([...args.slice(0,3),'RO',...args.slice(4),'--yes'])})`),/精确匹配/);
 });
